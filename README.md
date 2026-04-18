@@ -80,3 +80,7 @@ Issues and PRs welcome. Please open an issue first for major changes.
 ## 📄 License
 
 MIT
+
+---
+
+✨ **Built entirely with "Vibe Coding" principles, powered by Claude.** 🚀
