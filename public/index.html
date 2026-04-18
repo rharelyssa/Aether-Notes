@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#080810" />
+    <meta name="description" content="Vault Notes — Privacy-first local encrypted notes. No cloud, no accounts." />
+
+    <!--
+      SECURITY: Content Security Policy
+      - default-src 'none'  → block everything by default
+      - script-src 'self'   → only our own JS, no inline scripts, no CDN
+      - style-src 'self' 'unsafe-inline' fonts.googleapis.com → styles + Google Fonts CSS
+      - font-src fonts.gstatic.com → only font files from Google
+      - connect-src 'none'  → zero network requests from JS (fetch, XHR, WebSocket all blocked)
+      - img-src 'self' data: → only local images / data URIs
+      This means even if an attacker injects JS, it cannot exfiltrate data.
+    -->
+    <meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'none';" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Crimson+Pro:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+
+    <title>Vault Notes 🔒</title>
+  </head>
+  <body>
+    <noscript>JavaScript gereklidir.</noscript>
+    <div id="root"></div>
+  </body>
+</html>
