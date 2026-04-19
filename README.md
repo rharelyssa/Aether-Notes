@@ -109,7 +109,6 @@ npm run build
 - [ ] Biometric unlock (WebAuthn / Face ID / Touch ID)
 - [ ] Note graph view (visualize wiki links)
 - [ ] Quick capture — jot a note without unlocking vault
-- [ ] Writing goals — daily word count targets
 - [ ] Advanced search syntax (`tag:work date:today`)
 - [ ] Note templates
 - [ ] Configurable auto-lock timeout
