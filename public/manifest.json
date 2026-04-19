@@ -1,0 +1,35 @@
+{
+  "short_name": "Aether",
+  "name": "Aether Notes",
+  "description": "Privacy-first local encrypted note taking app",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "id": "aether-notes",
+  "start_url": ".",
+  "display": "standalone",
+  "orientation": "any",
+  "theme_color": "#111118",
+  "background_color": "#111118",
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "Yeni Not",
+      "short_name": "Yeni",
+      "description": "Hızlıca yeni not oluştur",
+      "url": "/?new=1",
+      "icons": [{ "src": "icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

@@ -175,9 +175,16 @@ function sanitizeHref(h) {
   try { const u=new URL(h); if(["http:","https:","mailto:"].includes(u.protocol))return h; } catch {}
   return /^[a-zA-Z0-9/_\-.#?=&%]+$/.test(h)?h:"#";
 }
+
+// Wiki link pattern: [[note başlığı]] → clickable span with data-wiki attr
+// Rendered as <span data-wiki="note başlığı"> so App can intercept clicks
 function renderMarkdown(raw) {
   if (!raw) return "";
   let t = raw.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  // Wiki links FIRST — before other processing
+  t = t.replace(/\[\[([^\]]+)\]\]/g, (_,title) =>
+    `<span class="wiki-link" data-wiki="${title.replace(/"/g,"&quot;")}" style="color:#5b7cf6;border-bottom:1px dashed #5b7cf6;cursor:pointer;font-style:italic;">[[${title}]]</span>`
+  );
   return t
     .replace(/^### (.+)$/gm,"<h3>$1</h3>").replace(/^## (.+)$/gm,"<h2>$1</h2>").replace(/^# (.+)$/gm,"<h1>$1</h1>")
     .replace(/\*\*(.+?)\*\*/g,"<strong>$1</strong>").replace(/\*(.+?)\*/g,"<em>$1</em>")
@@ -321,6 +328,7 @@ export default function App() {
   const [sidebarOpen,setSidebarOpen]   = useState(true);
   const [showExport,setShowExport]         = useState(false);
   const [showSettings,setShowSettings]     = useState(false);
+  const [pwaPrompt,setPwaPrompt]           = useState(null); // BeforeInstallPromptEvent
   const [showPhrase,setShowPhrase]         = useState(false);
   const [phraseMode,setPhraseMode]         = useState("view"); // "view" | "new"
   const [phrasePin,setPhrasePin]           = useState("");
@@ -355,6 +363,11 @@ export default function App() {
     if(v) setSavedVerifier(v); else setIsSettingPin(true);
     const s=localStorage.getItem(SK_STATS);
     if(s) try{setStats(JSON.parse(s));}catch{}
+
+    // PWA install prompt yakala
+    const handler=(e)=>{ e.preventDefault(); setPwaPrompt(e); };
+    window.addEventListener("beforeinstallprompt", handler);
+    return()=>window.removeEventListener("beforeinstallprompt", handler);
   },[]);
 
   useEffect(()=>{
@@ -530,7 +543,7 @@ export default function App() {
   const newNote=()=>{
     const now=new Date().toISOString();
     const n={ id:`${Date.now()}-${crypto.getRandomValues(new Uint32Array(1))[0]}`,
-      title:"",content:"",category:"personal",tags:[],color:"none",
+      title:"",content:"",category:"personal",tags:[],color:"none",pinned:false,
       locked:false,notePin:null,createdAt:now,updatedAt:now };
     const updated=[n,...notes]; setNotes(updated); saveNotes(updated); setActiveId(n.id);
     setETitle(""); setEContent(""); setECat("personal"); setETags([]); setEColor("none");
@@ -550,8 +563,7 @@ export default function App() {
     const actualLocked = eLocked && (notePinHash!==null);
     const updated=notes.map(n=>n.id===activeId
       ?{...n,title:eTitle||"Başlıksız",content:eContent,category:eCat,tags:eTags,
-          color:eColor,locked:actualLocked,notePin:notePinHash,updatedAt:now}:n);
-    setNotes(updated); await saveNotes(updated); updStats(updated); setDirty(false); resetAutoLock();
+          color:eColor,locked:actualLocked,notePin:notePinHash,updatedAt:now}:n);    setNotes(updated); await saveNotes(updated); updStats(updated); setDirty(false); resetAutoLock();
   },[activeId,eTitle,eContent,eCat,eTags,eColor,eLocked,eNotePin,notes,noteUnlock,saveNotes,updStats,resetAutoLock]);
 
   useEffect(()=>{
@@ -575,6 +587,12 @@ export default function App() {
   const addTag=()=>{
     const t=eTagIn.trim().toLowerCase().replace(/\s+/g,"-");
     if(t&&!eTags.includes(t)&&eTags.length<8){ setETags([...eTags,t]); setETagIn(""); setDirty(true); }
+  };
+
+  const togglePin=async(id)=>{
+    const updated=notes.map(n=>n.id===id?{...n,pinned:!n.pinned}:n);
+    setNotes(updated); await saveNotes(updated); resetAutoLock();
+    showToast(updated.find(n=>n.id===id)?.pinned?"Sabitlendi 📌":"Sabitlenme kaldırıldı");
   };
 
   // ── COMMAND PALETTE ──
@@ -605,7 +623,7 @@ export default function App() {
     const q=search.toLowerCase();
     const sOk=!q||n.title.toLowerCase().includes(q)||n.content.toLowerCase().includes(q)||(n.tags||[]).some(t=>t.includes(q));
     return cOk&&tOk&&sOk;
-  });
+  }).sort((a,b)=>(b.pinned?1:0)-(a.pinned?1:0)); // Sabitlenmiş notlar üstte
 
   // ── HELPER: not arka plan rengi ──
   const noteEditorBg=(colorId)=>{
@@ -829,6 +847,19 @@ export default function App() {
           <span>⌕ Komut veya ara…</span>
           <kbd style={{background:T.border,border:"none",color:T.textMuted,padding:"1px 5px",borderRadius:3,fontSize:10}}>⌘K</kbd>
         </button>
+        {pwaPrompt&&(
+          <button style={{...topBtn(T),color:T.success,borderColor:T.success+"66",
+            fontSize:11,width:"auto",padding:"0 10px",gap:4,display:"flex",alignItems:"center"}}
+            title="Uygulamayı yükle"
+            onClick={async()=>{
+              pwaPrompt.prompt();
+              const {outcome}=await pwaPrompt.userChoice;
+              if(outcome==="accepted") showToast("Aether Notes yüklendi! 🎉");
+              setPwaPrompt(null);
+            }}>
+            ⬇ Yükle
+          </button>
+        )}
         {[["📤","Dışa/İçe Aktar",()=>setShowExport(true)],["📊","İstatistikler",()=>setShowStats(true)],
           ["⚙️","Ayarlar",()=>setShowSettings(true)],
           [theme==="dark"?"☀":"🌙","Tema",toggleTheme]].map(([ico,title,fn])=>(
@@ -944,13 +975,23 @@ export default function App() {
                       opacity:activeId===note.id?1:.5}}/>
                     <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",paddingLeft:6}}>
                       <div style={{fontSize:13,fontWeight:600,color:T.text,whiteSpace:"nowrap",
-                        overflow:"hidden",textOverflow:"ellipsis",flex:1,marginRight:8}}>
+                        overflow:"hidden",textOverflow:"ellipsis",flex:1,marginRight:4}}>
+                        {note.pinned&&<span style={{color:T.accent,marginRight:4}}>📌</span>}
                         {note.locked?"🔒 ":""}{note.title||"Başlıksız"}
                       </div>
-                      <button className="del-btn"
-                        style={{background:"none",border:"none",color:T.textMuted,cursor:"pointer",
-                          fontSize:14,lineHeight:1,opacity:.4,flexShrink:0,transition:"opacity .15s"}}
-                        onClick={e=>{e.stopPropagation();setDeleteConfirm(note.id);}}>×</button>
+                      <div style={{display:"flex",gap:2,flexShrink:0}}>
+                        <button className="del-btn"
+                          style={{background:"none",border:"none",
+                            color:note.pinned?T.accent:T.textMuted,cursor:"pointer",
+                            fontSize:12,lineHeight:1,opacity:note.pinned?1:.3,flexShrink:0,
+                            transition:"opacity .15s",padding:"0 2px"}}
+                          title={note.pinned?"Sabitlemeyi kaldır":"Sabitle"}
+                          onClick={e=>{e.stopPropagation();togglePin(note.id);}}>📌</button>
+                        <button className="del-btn"
+                          style={{background:"none",border:"none",color:T.textMuted,cursor:"pointer",
+                            fontSize:14,lineHeight:1,opacity:.4,flexShrink:0,transition:"opacity .15s"}}
+                          onClick={e=>{e.stopPropagation();setDeleteConfirm(note.id);}}>×</button>
+                      </div>
                     </div>
                     {note.locked
                       ?<div style={{fontSize:11,color:T.textMuted,marginTop:4,paddingLeft:6,fontStyle:"italic"}}>🔐 Kilitli · PIN ile aç</div>
@@ -1161,18 +1202,35 @@ export default function App() {
               </div>
 
               {ePreview
-                ?<div style={{flex:1,padding:"20px 24px",overflowY:"auto",lineHeight:1.9,fontSize:14,color:T.text}}
-                    dangerouslySetInnerHTML={{__html:renderMarkdown(eContent)||`<p style="color:${T.textMuted}">İçerik yok</p>`}}/>
+                ?<div
+                    style={{flex:1,padding:"20px 24px",overflowY:"auto",lineHeight:1.9,fontSize:14,color:T.text}}
+                    dangerouslySetInnerHTML={{__html:renderMarkdown(eContent)||`<p style="color:${T.textMuted}">İçerik yok</p>`}}
+                    onClick={e=>{
+                      // Wiki link tıklaması
+                      const wiki=e.target.dataset?.wiki;
+                      if(!wiki) return;
+                      const target=notes.find(n=>n.title.toLowerCase()===wiki.toLowerCase());
+                      if(target){ selectNote(target); showToast(`"${target.title}" notuna geçildi`); }
+                      else showToast(`"${wiki}" notu bulunamadı`,"warn");
+                    }}
+                  />
                 :<textarea ref={editorRef}
                     style={{flex:1,background:"transparent",border:"none",outline:"none",color:T.text,
                       fontSize:14,fontFamily:"'Crimson Pro','Georgia',serif",padding:"20px 24px",
                       resize:"none",lineHeight:1.9,width:"100%",boxSizing:"border-box"}}
-                    placeholder={"Yazmaya başla…\n\n# Başlık  **kalın**  *italik*  `kod`\n- liste  > alıntı"}
+                    placeholder={"Yazmaya başla…\n\n# Başlık  **kalın**  *italik*  `kod`\n- liste  > alıntı\n[[Başka Not Adı]] — not bağlantısı"}
                     value={eContent} onChange={e=>{setEContent(e.target.value);setDirty(true);}}/>
               }
               <div style={{padding:"6px 24px",borderTop:`1px solid ${T.borderLight}`,
-                display:"flex",gap:20,fontSize:11,color:T.textMuted,flexShrink:0}}>
-                <span>{eContent.length} kr</span><span>{wc(eContent)} kelime</span><span>{eContent.split(/\n/).length} satır</span>
+                display:"flex",gap:20,fontSize:11,color:T.textMuted,flexShrink:0,flexWrap:"wrap"}}>
+                <span>{eContent.length} kr</span>
+                <span>{wc(eContent)} kelime</span>
+                <span>{eContent.split(/\n/).length} satır</span>
+                {(eContent.match(/\[\[([^\]]+)\]\]/g)||[]).length>0&&(
+                  <span style={{color:T.accent}}>
+                    🔗 {(eContent.match(/\[\[([^\]]+)\]\]/g)||[]).length} bağlantı
+                  </span>
+                )}
               </div>
             </>
           )}
@@ -1753,5 +1811,6 @@ const globalCSS = T=>`
   code{background:${T.inputBg};padding:2px 6px;border-radius:4px;font-size:.9em;}
   ul,ol{padding-left:20px;margin:4px 0;}
   a{color:${T.accent};}p{margin:.3em 0;}
+  .wiki-link:hover{background:${T.accentBg};border-radius:3px;}
   select option{background:${T.inputBg};color:${T.text};}
 `;
