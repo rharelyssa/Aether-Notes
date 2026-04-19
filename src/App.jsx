@@ -6,7 +6,6 @@ import { useState, useEffect, useRef, useCallback } from "react";
 const CRYPTO_VERSION       = "V1";
 const PBKDF2_ITER          = 310_000;
 const PIN_VERIFY_SALT      = new TextEncoder().encode("vault-pin-verify-v1-do-not-change");
-const RECOVERY_DERIVE_SALT = new TextEncoder().encode("vault-recovery-derive-v1-static");
 const MAX_ATTEMPTS         = 5;
 const LOCKOUT_SECS         = 30;
 
@@ -61,6 +60,7 @@ async function makePinVerifier(pin) {
   return buf2b64(await crypto.subtle.digest("SHA-256", await crypto.subtle.exportKey("raw", k)));
 }
 function timingSafeEqual(a, b) {
+  if(!a || !b) return false;
   if (a.length !== b.length) return false;
   let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
@@ -143,7 +143,7 @@ async function openRecoveryBlob(phrase) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// VAULT EXPORT / IMPORT
+// AETHER EXPORT / IMPORT
 // ═══════════════════════════════════════════════════════════════════════════════
 async function exportVault(notes, pin) {
   const payload   = JSON.stringify({ notes, exportedAt: new Date().toISOString() });
@@ -437,7 +437,7 @@ export default function App() {
         const loaded=await loadNotes(np); setNotes(loaded);
         if(loaded.length>0) setActiveId(loaded[0].id);
         updStats(loaded); setLoading(false);
-        setScreen("app"); setPin(""); resetAutoLock(); showToast("Vault açıldı 🔓");
+        setScreen("app"); setPin(""); resetAutoLock(); showToast("Aether açıldı 🔓");
       } else {
         recordFail(); shake_(); const rem=lockRem();
         if(rem>0){ setLockoutSecs(rem); setPinError(`${MAX_ATTEMPTS} hatalı deneme — ${rem}s`);
@@ -459,7 +459,7 @@ export default function App() {
     // Recovery blob oluştur (boş vault ile)
     await saveRecoveryBlob(loaded, phrase);
     setLoading(false); setScreen("app"); setPinStep("enter"); setGeneratedPhrase("");
-    resetAutoLock(); showToast("Vault oluşturuldu! 🎉");
+    resetAutoLock(); showToast("Aether oluşturuldu! 🎉");
   };
 
   // ── RECOVERY FLOW ──
@@ -497,7 +497,7 @@ export default function App() {
           setNotes(arr); if(arr.length>0) setActiveId(arr[0].id);
           updStats(arr); setRecoveryLoading(false);
           setScreen2(null); setScreen("app"); resetAutoLock();
-          showToast("Vault kurtarıldı & yeni PIN ayarlandı 🎉");
+          showToast("Aether kurtarıldı & yeni PIN ayarlandı 🎉");
         } else { shake_(); setRecoveryError("PINler eşleşmiyor"); setConfirmNewPin(""); setNewPinStep("enter"); }
       }
     }
@@ -507,10 +507,24 @@ export default function App() {
   const activeNote=notes.find(n=>n.id===activeId)||null;
 
   const selectNote=(note)=>{
-    if(note.locked){ setActiveId(note.id); setNoteUnlock(note); return; }
-    setActiveId(note.id); setETitle(note.title); setEContent(note.content);
-    setECat(note.category); setETags(note.tags||[]); setELocked(false);
-    setEColor(note.color||"none"); setENotePin(""); setETagIn(""); setEPreview(false); setDirty(false);
+    // Her zaman notes array'inden taze notu oku — closure stale olabilir
+    const fresh = notes.find(n=>n.id===note.id) || note;
+    // Kilitli ama PIN yok — direkt aç
+    if(fresh.locked && !fresh.notePin){
+      setActiveId(fresh.id); setETitle(fresh.title); setEContent(fresh.content);
+      setECat(fresh.category); setETags(fresh.tags||[]); setELocked(true);
+      setEColor(fresh.color||"none"); setENotePin(""); setETagIn(""); setEPreview(false); setDirty(false);
+      return;
+    }
+    // Kilitli ve PIN var — sadece activeId set et, editör PIN ekranını gösterir
+    if(fresh.locked){
+      setActiveId(fresh.id);
+      return;
+    }
+    // Açık not
+    setActiveId(fresh.id); setETitle(fresh.title); setEContent(fresh.content);
+    setECat(fresh.category); setETags(fresh.tags||[]); setELocked(false);
+    setEColor(fresh.color||"none"); setENotePin(""); setETagIn(""); setEPreview(false); setDirty(false);
   };
 
   const newNote=()=>{
@@ -532,9 +546,11 @@ export default function App() {
     let notePinHash=null;
     if(eLocked&&eNotePin) notePinHash=await makePinVerifier(eNotePin);
     else if(eLocked&&cur?.notePin) notePinHash=cur.notePin;
+    // PIN yoksa kilitli kaydetme — locked'ı false yap
+    const actualLocked = eLocked && (notePinHash!==null);
     const updated=notes.map(n=>n.id===activeId
       ?{...n,title:eTitle||"Başlıksız",content:eContent,category:eCat,tags:eTags,
-          color:eColor,locked:eLocked,notePin:notePinHash,updatedAt:now}:n);
+          color:eColor,locked:actualLocked,notePin:notePinHash,updatedAt:now}:n);
     setNotes(updated); await saveNotes(updated); updStats(updated); setDirty(false); resetAutoLock();
   },[activeId,eTitle,eContent,eCat,eTags,eColor,eLocked,eNotePin,notes,noteUnlock,saveNotes,updStats,resetAutoLock]);
 
@@ -564,11 +580,11 @@ export default function App() {
   // ── COMMAND PALETTE ──
   const cmdActions=[
     {id:"new",     label:"Yeni Not",           icon:"✏️", action:()=>{newNote();setCmdOpen(false);}},
-    {id:"export",  label:"Vault Dışa Aktar",   icon:"📤", action:()=>{setShowExport(true);setCmdOpen(false);}},
-    {id:"import",  label:"Vault İçe Aktar",    icon:"📥", action:()=>{importRef.current?.click();setCmdOpen(false);}},
+    {id:"export",  label:"Aether Dışa Aktar",   icon:"📤", action:()=>{setShowExport(true);setCmdOpen(false);}},
+    {id:"import",  label:"Aether İçe Aktar",    icon:"📥", action:()=>{importRef.current?.click();setCmdOpen(false);}},
     {id:"stats",   label:"İstatistikler",       icon:"📊", action:()=>{setShowStats(true);setCmdOpen(false);}},
     {id:"theme",   label:theme==="dark"?"Aydınlık Mod":"Karanlık Mod", icon:theme==="dark"?"☀":"🌙", action:()=>{toggleTheme();setCmdOpen(false);}},
-    {id:"lock",    label:"Vault'u Kilitle",     icon:"🔒", action:()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");setCmdOpen(false);}},
+    {id:"lock",    label:"Aether'i Kilitle",     icon:"🔒", action:()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");setCmdOpen(false);}},
     ...CATEGORIES.filter(c=>c.id!=="all").map(c=>({
       id:`cat-${c.id}`, label:`${c.label} notlarını göster`, icon:c.icon,
       action:()=>{setFilterCat(c.id);setCmdOpen(false);}
@@ -642,7 +658,7 @@ export default function App() {
         <div style={{textAlign:"center"}}>
           <div style={{fontSize:36,marginBottom:8}}>🔑</div>
           <div style={{fontSize:18,fontWeight:700,letterSpacing:2,color:T.text}}>
-            {recoverySuccess?"Yeni PIN Belirle":"Vault Kurtarma"}
+            {recoverySuccess?"Yeni PIN Belirle":"Aether Kurtarma"}
           </div>
           <div style={{fontSize:12,color:T.textMuted,marginTop:4}}>
             {recoverySuccess?`PIN'i ${newPinStep==="enter"?"gir":"tekrar gir"}`:"12 kelimelik recovery phrase'ini gir"}
@@ -662,7 +678,7 @@ export default function App() {
               borderRadius:10,cursor:"pointer",fontSize:14,fontFamily:"inherit",fontWeight:700,
               opacity:recoveryLoading?.6:1}}
               onClick={handleRecovery} disabled={recoveryLoading}>
-              {recoveryLoading?"Doğrulanıyor…":"Vault'u Kurtart →"}
+              {recoveryLoading?"Doğrulanıyor…":"Aether'i Kurtart →"}
             </button>
           </>
         ):(
@@ -737,7 +753,7 @@ export default function App() {
               fontSize:13,fontFamily:"inherit",fontWeight:700,transition:"all .2s"}}
               onClick={()=>{if(phraseConfirmed)finalizeSetup();}}
               disabled={!phraseConfirmed||loading}>
-              {loading?"Oluşturuluyor…":"Vault'u Oluştur →"}
+              {loading?"Oluşturuluyor…":"Aether'i Oluştur →"}
             </button>
           </div>
         </div>
@@ -750,7 +766,7 @@ export default function App() {
             background:"linear-gradient(135deg,#3d3580,#5b7cf6)",
             display:"flex",alignItems:"center",justifyContent:"center",
             fontSize:32,boxShadow:`0 0 40px ${T.accent}44`}}>🔒</div>
-          <div style={{fontSize:20,fontWeight:700,letterSpacing:4,color:T.text}}>VAULT</div>
+          <div style={{fontSize:20,fontWeight:700,letterSpacing:4,color:T.text}}>AETHER</div>
           <div style={{fontSize:12,color:T.textMuted,letterSpacing:2,textAlign:"center"}}>
             {isSettingPin?(pinStep==="enter"?"Yeni PIN belirle (4 hane)":"PIN'i tekrar gir")
               :lockoutSecs>0?`Kilitli — ${lockoutSecs}s`:loading?"Doğrulanıyor…":"PIN'ini gir"}
@@ -774,38 +790,7 @@ export default function App() {
     </div>
   );
 
-  // ── NOTE UNLOCK ──
-  if(noteUnlock) return (
-    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",
-      background:T.appBg,fontFamily:"'IBM Plex Sans',sans-serif"}}>
-      <style>{globalCSS(T)}</style>
-      <div style={{padding:40,borderRadius:20,width:320,display:"flex",flexDirection:"column",
-        alignItems:"center",gap:18,background:T.sidebar,border:`1px solid ${T.border}`,boxShadow:"0 8px 40px #0004"}}>
-        <div style={{fontSize:36}}>🔐</div>
-        <div style={{fontSize:14,fontWeight:700,color:T.text,textAlign:"center"}}>"{noteUnlock.title||"Başlıksız"}"</div>
-        <div style={{fontSize:12,color:T.textMuted}}>Not PIN'ini gir</div>
-        <PinDots len={ePinIn.length} shk={shake}/>
-        {ePinErr&&<div style={{color:T.danger,fontSize:12}}>{ePinErr}</div>}
-        <PinPad pinVal={ePinIn} onDigit={async d=>{
-          if(d==="⌫"){setEPinIn(p=>p.slice(0,-1));setEPinErr("");return;}
-          const np=ePinIn+d; setEPinIn(np);
-          if(np.length===4){
-            const cand=await makePinVerifier(np);
-            if(timingSafeEqual(cand,noteUnlock.notePin)){
-              const n=noteUnlock; setActiveId(n.id); setETitle(n.title); setEContent(n.content);
-              setECat(n.category); setETags(n.tags||[]); setEColor(n.color||"none"); setELocked(true);
-              setNoteUnlock(null); setEPinIn(""); setEPinErr(""); setDirty(false);
-            } else { shake_(); setEPinErr("Yanlış PIN"); setEPinIn(""); }
-          }
-        }} disabled={false}/>
-        <button style={{background:"none",border:`1px solid ${T.border}`,color:T.textMuted,
-          padding:"6px 16px",borderRadius:8,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}
-          onClick={()=>{setNoteUnlock(null);setEPinIn("");setEPinErr("");setActiveId(null);}}>
-          ← Geri
-        </button>
-      </div>
-    </div>
-  );
+  // ── NOTE UNLOCK — artık modal overlay, ayrı sayfa değil ──
 
   // ══════════════════════════════════════════════════════════════
   // MAIN APP
@@ -834,7 +819,7 @@ export default function App() {
         borderBottom:`1px solid ${T.border}`,padding:"0 16px",gap:12,flexShrink:0,zIndex:10,
         boxShadow:theme==="light"?"0 1px 4px #0001":"none"}}>
         <button style={topBtn(T)} onClick={()=>setSidebarOpen(p=>!p)}>☰</button>
-        <span style={{fontWeight:700,fontSize:15,letterSpacing:3,color:T.text}}>VAULT</span>
+        <span style={{fontWeight:700,fontSize:15,letterSpacing:3,color:T.text}}>AETHER</span>
         <span style={{fontSize:10,color:T.textMuted,letterSpacing:1}}>· AES-256-GCM</span>
         <div style={{flex:1}}/>
         <button style={{display:"flex",alignItems:"center",gap:8,background:T.inputBg,
@@ -993,10 +978,74 @@ export default function App() {
 
         {/* EDITOR */}
         <div style={{flex:1,display:"flex",flexDirection:"column",
-          background:activeNote&&!activeNote.locked?noteEditorBg(eColor):T.editor,
+          background:activeNote&&activeNote.id===activeId&&!activeNote.locked?noteEditorBg(eColor):T.editor,
           overflow:"hidden",transition:"background .3s"}}>
 
-          {activeNote&&!activeNote.locked?(
+          {/* Kilitli not — basit PIN input */}
+          {activeNote?.locked&&(
+            <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",
+              justifyContent:"center",gap:16,padding:40}}>
+              <div style={{fontSize:44}}>🔒</div>
+              <div style={{fontSize:16,fontWeight:700,color:T.text}}>
+                {activeNote.title||"Başlıksız"}
+              </div>
+              <div style={{fontSize:12,color:T.textMuted}}>Bu not PIN ile kilitli</div>
+              <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                <input
+                  key={activeNote.id}
+                  type="password"
+                  inputMode="numeric"
+                  maxLength={4}
+                  placeholder="PIN"
+                  autoFocus
+                  style={{background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                    outline:"none",color:T.text,fontSize:22,fontFamily:"'IBM Plex Mono',monospace",
+                    padding:"10px 16px",borderRadius:10,width:110,letterSpacing:8,textAlign:"center",
+                    transition:"border .2s"}}
+                  onFocus={e=>e.target.style.borderColor=T.accent}
+                  onBlur={e=>e.target.style.borderColor=T.inputBorder}
+                  onChange={async e=>{
+                    const val=e.target.value.replace(/\D/g,"").slice(0,4);
+                    e.target.value=val;
+                    if(val.length===4){
+                      if(!activeNote.notePin){
+                        // PIN hash yok — direkt aç
+                        setETitle(activeNote.title); setEContent(activeNote.content);
+                        setECat(activeNote.category); setETags(activeNote.tags||[]);
+                        setEColor(activeNote.color||"none"); setELocked(false);
+                        setENotePin(""); setETagIn(""); setEPreview(false); setDirty(false);
+                        // locked'ı kaldır
+                        const updated=notes.map(n=>n.id===activeNote.id?{...n,locked:false,notePin:null}:n);
+                        setNotes(updated); await saveNotes(updated);
+                        return;
+                      }
+                      const cand=await makePinVerifier(val);
+                      if(timingSafeEqual(cand,activeNote.notePin)){
+                        // Doğru PIN — notu aç
+                        setETitle(activeNote.title); setEContent(activeNote.content);
+                        setECat(activeNote.category); setETags(activeNote.tags||[]);
+                        setEColor(activeNote.color||"none"); setELocked(true);
+                        setENotePin(""); setETagIn(""); setEPreview(false); setDirty(false);
+                        // locked=false yap ki editör görünsün, notePin koru
+                        const updated=notes.map(n=>n.id===activeNote.id?{...n,locked:false}:n);
+                        setNotes(updated);
+                        showToast("Not açıldı 🔓");
+                      } else {
+                        e.target.value="";
+                        e.target.style.borderColor=T.danger;
+                        setTimeout(()=>e.target.style.borderColor=T.inputBorder,800);
+                        showToast("Yanlış PIN","danger");
+                      }
+                    }
+                  }}
+                />
+              </div>
+              <div style={{fontSize:11,color:T.textMuted}}>4 haneyi gir, otomatik açılır</div>
+            </div>
+          )}
+
+          {/* Normal editör — not açık */}
+          {activeNote&&!activeNote.locked&&(
             <>
               {/* Toolbar */}
               <div style={{padding:"10px 20px",borderBottom:`1px solid ${T.border}`,
@@ -1077,20 +1126,37 @@ export default function App() {
                   onChange={e=>setETagIn(e.target.value)}
                   onKeyDown={e=>{if(e.key==="Enter"||e.key===","){e.preventDefault();addTag();}}}/>
                 <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8}}>
-                  <button style={{...toolBtn(T),
-                    border:`1px solid ${eLocked?T.danger+"66":T.inputBorder}`,
-                    color:eLocked?T.danger:T.textMuted}}
-                    onClick={()=>{setELocked(p=>!p);setDirty(true);}}>
-                    {eLocked?"🔒 Kilitli":"🔓 Açık"}
-                  </button>
-                  {eLocked&&!activeNote?.notePin&&(
-                    <input style={{background:T.inputBg,border:`1px solid ${T.inputBorder}`,
-                      outline:"none",color:T.text,fontSize:14,fontFamily:"inherit",
-                      padding:"3px 10px",borderRadius:6,width:110,letterSpacing:4,textAlign:"center"}}
-                      type="password" inputMode="numeric" maxLength={4} placeholder="PIN"
+                  {!eLocked&&(
+                    <input style={{background:T.inputBg,
+                      border:`2px solid ${eNotePin.length===4?T.success:T.inputBorder}`,
+                      outline:"none",color:T.text,fontSize:14,fontFamily:"'IBM Plex Mono',monospace",
+                      padding:"3px 10px",borderRadius:6,width:110,letterSpacing:4,textAlign:"center",
+                      transition:"border .2s"}}
+                      type="password" inputMode="numeric" maxLength={4} placeholder="Not PIN"
                       value={eNotePin} onChange={e=>setENotePin(e.target.value.replace(/\D/g,"").slice(0,4))}/>
                   )}
-                  {eLocked&&activeNote?.notePin&&<span style={{fontSize:11,color:T.textMuted}}>PIN ayarlı ✓</span>}
+                  <button style={{...toolBtn(T),
+                    border:`1px solid ${eLocked?T.danger+"66":eNotePin.length===4?T.success+"66":T.inputBorder}`,
+                    color:eLocked?T.danger:eNotePin.length===4?T.success:T.textMuted}}
+                    onClick={async()=>{
+                      if(eLocked){
+                        setELocked(false); setENotePin(""); setDirty(true);
+                      } else {
+                        if(!eNotePin){showToast("Önce PIN gir","warn");return;}
+                        if(eNotePin.length<4){showToast("PIN 4 hane olmalı","warn");return;}
+                        const now=new Date().toISOString();
+                        const notePinHash=await makePinVerifier(eNotePin);
+                        const updated=notes.map(n=>n.id===activeId
+                          ?{...n,title:eTitle||"Başlıksız",content:eContent,category:eCat,
+                              tags:eTags,color:eColor,locked:true,notePin:notePinHash,updatedAt:now}:n);
+                        setNotes(updated); await saveNotes(updated); updStats(updated);
+                        setELocked(true); setDirty(false);
+                        showToast("Not kilitlendi 🔒");
+                      }
+                    }}>
+                    {eLocked?"🔒 Kilitli":"🔓 Kilitle"}
+                  </button>
+                  {eLocked&&<span style={{fontSize:11,color:T.textMuted}}>PIN ayarlı ✓</span>}
                 </div>
               </div>
 
@@ -1109,34 +1175,22 @@ export default function App() {
                 <span>{eContent.length} kr</span><span>{wc(eContent)} kelime</span><span>{eContent.split(/\n/).length} satır</span>
               </div>
             </>
-          ):(
+          )}
+
+          {/* Boş state */}
+          {!activeNote&&(
             <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",
               justifyContent:"center",color:T.textMuted,gap:12}}>
-              {activeNote?.locked?(
-                <>
-                  <div style={{fontSize:48}}>🔒</div>
-                  <div style={{fontSize:15,fontWeight:600,color:T.textSub}}>Bu not kilitli</div>
-                  <div style={{fontSize:12,textAlign:"center",maxWidth:260,lineHeight:1.7}}>
-                    İçeriği görmek için listedeki nota tıkla ve PIN'ini gir.
-                  </div>
-                  <button style={{marginTop:8,background:T.accent,border:"none",color:"#fff",
-                    padding:"10px 24px",borderRadius:8,fontSize:13,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}
-                    onClick={()=>setNoteUnlock(activeNote)}>🔓 PIN ile Aç</button>
-                </>
-              ):(
-                <>
-                  <div style={{fontSize:48}}>🔒</div>
-                  <div style={{fontSize:15,fontWeight:600,color:T.textSub}}>Vault Notes</div>
-                  <div style={{fontSize:12}}>Bir not seç veya yeni not oluştur</div>
-                  <button style={{marginTop:8,background:T.accent,border:"none",color:"#fff",
-                    padding:"10px 24px",borderRadius:8,fontSize:13,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}
-                    onClick={newNote}>+ Yeni Not</button>
-                  <div style={{fontSize:11,color:T.textMuted,marginTop:4}}>
-                    veya <kbd style={{background:T.inputBg,border:`1px solid ${T.inputBorder}`,
-                      padding:"2px 6px",borderRadius:4,fontSize:10}}>⌘K</kbd>
-                  </div>
-                </>
-              )}
+              <div style={{fontSize:48}}>✦</div>
+              <div style={{fontSize:15,fontWeight:600,color:T.textSub}}>Aether Notes</div>
+              <div style={{fontSize:12}}>Bir not seç veya yeni not oluştur</div>
+              <button style={{marginTop:8,background:T.accent,border:"none",color:"#fff",
+                padding:"10px 24px",borderRadius:8,fontSize:13,cursor:"pointer",fontFamily:"inherit",fontWeight:600}}
+                onClick={newNote}>+ Yeni Not</button>
+              <div style={{fontSize:11,color:T.textMuted,marginTop:4}}>
+                veya <kbd style={{background:T.inputBg,border:`1px solid ${T.inputBorder}`,
+                  padding:"2px 6px",borderRadius:4,fontSize:10}}>⌘K</kbd>
+              </div>
             </div>
           )}
         </div>
@@ -1199,7 +1253,7 @@ export default function App() {
           <div style={{background:T.sidebar,border:`1px solid ${T.border}`,borderRadius:16,
             padding:28,width:380,maxWidth:"92vw"}} onClick={e=>e.stopPropagation()}>
             <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
-              <span style={{fontWeight:700,fontSize:15,color:T.text}}>📤 Vault Yedekle</span>
+              <span style={{fontWeight:700,fontSize:15,color:T.text}}>📤 Aether Yedekle</span>
               <button style={{background:"none",border:"none",color:T.textMuted,cursor:"pointer",fontSize:20}}
                 onClick={()=>setShowExport(false)}>×</button>
             </div>
@@ -1393,13 +1447,13 @@ export default function App() {
                     localStorage.clear(); window.location.reload();
                   }
                 }}>
-                ⚠ Vault'u Sıfırla (tüm veriler silinir)
+                ⚠ Aether'i Sıfırla (tüm veriler silinir)
               </button>
             </div>
 
             {/* Versiyon */}
             <div style={{fontSize:10,color:T.textMuted,textAlign:"center",lineHeight:1.8}}>
-              Vault Notes v1.0 · AES-256-GCM · PBKDF2 310k iter · Yerel & Açık Kaynak
+              Aether Notes v1.0 · AES-256-GCM · PBKDF2 310k iter · Yerel & Açık Kaynak
             </div>
           </div>
         </div>
@@ -1419,6 +1473,7 @@ export default function App() {
             </div>
 
             {!phraseRevealed&&!newPhraseGenerated?(
+              /* PIN doğrulama pad'i */
               <>
                 <div style={{fontSize:12,color:T.textMuted,lineHeight:1.7}}>
                   Güvenlik için önce PIN'ini doğrula.
@@ -1447,16 +1502,21 @@ export default function App() {
                         if(np.length===4){
                           const cand=await makePinVerifier(np);
                           if(timingSafeEqual(cand,savedVerifier)){
-                            if(phraseMode==="view"&&sessionPhrase.current){
-                              // Zaten bellekte phrase var — direkt göster
+                            if(phraseMode==="view" && sessionPhrase.current){
+                              // Oturum bellekte — direkt göster
                               setNewPhraseGenerated(sessionPhrase.current);
+                            } else if(phraseMode==="view" && !sessionPhrase.current){
+                              // Sayfa yenilenmiş, bellekte yok — kullanıcıya bildir
+                              // Güvenlik gereği eski phrase gösterilemez, yeni oluşturulmalı
+                              setPhrasePinErr("");
+                              setNewPhraseGenerated("__info__");
                             } else {
-                              // Yeni phrase üret (ilk kez veya yenile isteniyorsa)
+                              // phraseMode === "new" → yeni phrase üret
                               const phrase=generatePhrase(12);
                               setNewPhraseGenerated(phrase);
                               sessionPhrase.current=phrase;
                               await saveRecoveryBlob(notes, phrase);
-                              showToast(phraseMode==="new"?"Yeni recovery phrase oluşturuldu ✓":"Recovery phrase oluşturuldu ✓");
+                              showToast("Yeni recovery phrase oluşturuldu ✓");
                             }
                           } else {
                             setPhrasePinErr("Yanlış PIN"); setPhrasePin("");
@@ -1469,46 +1529,86 @@ export default function App() {
                 </div>
               </>
             ):(
-              <>
-                <div style={{fontSize:12,color:T.danger,lineHeight:1.7,fontWeight:600,textAlign:"center"}}>
-                  ⚠ Bu 12 kelimeyi güvenli bir yere yaz. Ekranda bir daha gösterilmeyecek.
-                </div>
-                {/* Kelime grid */}
-                <div style={{background:T.phraseBox,border:`1px solid ${T.inputBorder}`,
-                  borderRadius:12,padding:"14px 16px"}}>
-                  <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
-                    {(newPhraseGenerated||phraseRevealed).split(" ").map((w,i)=>(
-                      <div key={i} style={{display:"flex",alignItems:"center",gap:6,
-                        background:T.inputBg,border:`1px solid ${T.inputBorder}`,
-                        borderRadius:8,padding:"6px 10px"}}>
-                        <span style={{fontSize:10,color:T.textMuted,minWidth:18}}>{i+1}.</span>
-                        <span style={{fontSize:12,fontWeight:600,color:T.text,
-                          fontFamily:"'IBM Plex Mono',monospace"}}>{w}</span>
-                      </div>
-                    ))}
+              /* Phrase göster ya da "bellekte yok" bilgisi */
+              newPhraseGenerated === "__info__" ? (
+                /* Sayfa yenilenmiş, eski phrase bellekte yok */
+                <>
+                  <div style={{background:T.inputBg,border:`1px solid ${T.warn}44`,
+                    borderRadius:12,padding:16,textAlign:"center"}}>
+                    <div style={{fontSize:28,marginBottom:10}}>⚠️</div>
+                    <div style={{fontSize:13,fontWeight:600,color:T.text,marginBottom:8}}>
+                      Phrase artık görüntülenemiyor
+                    </div>
+                    <div style={{fontSize:12,color:T.textMuted,lineHeight:1.8}}>
+                      Recovery phrase güvenlik nedeniyle yalnızca oluşturulduğu anda gösterilir
+                      ve bellekte tutulur. Sayfa yenilendiğinde bellekten silinir.<br/><br/>
+                      Eğer phrase'ini kaybettiysen <strong style={{color:T.warn}}>yeni bir phrase oluşturman</strong> gerekiyor.
+                      Eski phrase artık çalışmayacak.
+                    </div>
                   </div>
-                </div>
-                <div style={{display:"flex",gap:10}}>
-                  <button style={{flex:1,background:T.inputBg,border:`1px solid ${T.inputBorder}`,
-                    color:T.text,padding:"9px 0",borderRadius:8,cursor:"pointer",
-                    fontSize:12,fontFamily:"inherit"}}
-                    onClick={()=>{
-                      const txt=newPhraseGenerated||phraseRevealed;
-                      const el=document.createElement("textarea");
-                      el.value=txt; document.body.appendChild(el); el.select();
-                      document.execCommand("copy"); document.body.removeChild(el);
-                      showToast("Kopyalandı ✓");
-                    }}>
-                    📋 Kopyala
-                  </button>
-                  <button style={{flex:1,background:T.success,border:"none",color:"#000",
-                    padding:"9px 0",borderRadius:8,cursor:"pointer",fontSize:12,
-                    fontFamily:"inherit",fontWeight:700}}
-                    onClick={()=>{setShowPhrase(false);setPhraseRevealed("");setNewPhraseGenerated("");showToast("Phrase kaydedildi, güvende ✓");}}>
-                    ✓ Yazdım, Kapat
-                  </button>
-                </div>
-              </>
+                  <div style={{display:"flex",gap:10}}>
+                    <button style={{flex:1,background:T.inputBg,border:`1px solid ${T.inputBorder}`,
+                      color:T.text,padding:"9px 0",borderRadius:8,cursor:"pointer",
+                      fontSize:12,fontFamily:"inherit"}}
+                      onClick={()=>{setShowPhrase(false);setNewPhraseGenerated("");}}>
+                      Kapat
+                    </button>
+                    <button style={{flex:1,background:T.danger,border:"none",color:"#fff",
+                      padding:"9px 0",borderRadius:8,cursor:"pointer",
+                      fontSize:12,fontFamily:"inherit",fontWeight:700}}
+                      onClick={async()=>{
+                        const phrase=generatePhrase(12);
+                        setNewPhraseGenerated(phrase);
+                        sessionPhrase.current=phrase;
+                        await saveRecoveryBlob(notes,phrase);
+                        showToast("Yeni recovery phrase oluşturuldu ✓");
+                      }}>
+                      🔄 Yeni Phrase Oluştur
+                    </button>
+                  </div>
+                </>
+              ) : (
+                /* Normal phrase gösterimi */
+                <>
+                  <div style={{fontSize:12,color:T.danger,lineHeight:1.7,fontWeight:600,textAlign:"center"}}>
+                    ⚠ Bu 12 kelimeyi güvenli bir yere yaz. Ekranda bir daha gösterilmeyecek.
+                  </div>
+                  <div style={{background:T.phraseBox,border:`1px solid ${T.inputBorder}`,
+                    borderRadius:12,padding:"14px 16px"}}>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                      {(newPhraseGenerated||phraseRevealed).split(" ").map((w,i)=>(
+                        <div key={i} style={{display:"flex",alignItems:"center",gap:6,
+                          background:T.inputBg,border:`1px solid ${T.inputBorder}`,
+                          borderRadius:8,padding:"6px 10px"}}>
+                          <span style={{fontSize:10,color:T.textMuted,minWidth:18}}>{i+1}.</span>
+                          <span style={{fontSize:12,fontWeight:600,color:T.text,
+                            fontFamily:"'IBM Plex Mono',monospace"}}>{w}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:10}}>
+                    <button style={{flex:1,background:T.inputBg,border:`1px solid ${T.inputBorder}`,
+                      color:T.text,padding:"9px 0",borderRadius:8,cursor:"pointer",
+                      fontSize:12,fontFamily:"inherit"}}
+                      onClick={()=>{
+                        const txt=newPhraseGenerated||phraseRevealed;
+                        const el=document.createElement("textarea");
+                        el.value=txt; document.body.appendChild(el); el.select();
+                        document.execCommand("copy"); document.body.removeChild(el);
+                        showToast("Kopyalandı ✓");
+                      }}>
+                      📋 Kopyala
+                    </button>
+                    <button style={{flex:1,background:T.success,border:"none",color:"#000",
+                      padding:"9px 0",borderRadius:8,cursor:"pointer",fontSize:12,
+                      fontFamily:"inherit",fontWeight:700}}
+                      onClick={()=>{setShowPhrase(false);setPhraseRevealed("");setNewPhraseGenerated("");showToast("Phrase kaydedildi, güvende ✓");}}>
+                      ✓ Yazdım, Kapat
+                    </button>
+                  </div>
+                </>
+              )
             )}
           </div>
         </div>
@@ -1517,7 +1617,8 @@ export default function App() {
       {/* ══ ADD CATEGORY MODAL ══ */}
       {showAddCat&&(
         <div style={{position:"fixed",inset:0,background:"#0008",display:"flex",
-          alignItems:"center",justifyContent:"center",zIndex:110}} onClick={()=>setShowAddCat(false)}>
+          alignItems:"center",justifyContent:"center",zIndex:300}}
+          onClick={e=>{e.stopPropagation();setShowAddCat(false);}}>
           <div style={{background:T.sidebar,border:`1px solid ${T.border}`,borderRadius:16,
             padding:28,width:340,maxWidth:"92vw",display:"flex",flexDirection:"column",gap:16}}
             onClick={e=>e.stopPropagation()}>
@@ -1530,13 +1631,12 @@ export default function App() {
             {/* Önizleme */}
             <div style={{display:"flex",alignItems:"center",gap:10,background:T.inputBg,
               border:`1px solid ${T.inputBorder}`,borderRadius:10,padding:"10px 14px"}}>
-              <span style={{width:12,height:12,borderRadius:"50%",background:newCatColor,
-                border:`1px solid ${T.border}`,flexShrink:0}}/>
+              <span style={{fontSize:16}}>{newCatIcon}</span>
+              <span style={{width:10,height:10,borderRadius:"50%",background:newCatColor,flexShrink:0}}/>
               <span style={{fontSize:13,color:T.text,flex:1}}>
                 {newCatName||<span style={{color:T.textMuted,fontStyle:"italic"}}>Kategori adı</span>}
               </span>
-              <span style={{fontSize:11,color:T.textMuted,background:T.border,
-                padding:"1px 6px",borderRadius:8}}>0</span>
+              <span style={{fontSize:11,color:T.textMuted,background:T.border,padding:"1px 6px",borderRadius:8}}>0</span>
             </div>
 
             {/* İsim */}
@@ -1553,7 +1653,19 @@ export default function App() {
               />
             </div>
 
-            {/* Renk */}
+            {/* İkon */}
+            <div>
+              <div style={{fontSize:11,color:T.textMuted,marginBottom:8,letterSpacing:1}}>İKON</div>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                {["📁","📝","💼","🏠","❤️","⭐","🎯","🔬","🎨","✈️","🍕","💪","📚","🎵","💡","🌿"].map(ico=>(
+                  <button key={ico}
+                    style={{width:34,height:34,borderRadius:8,background:newCatIcon===ico?T.accentBg:T.inputBg,
+                      border:`2px solid ${newCatIcon===ico?T.accent:T.inputBorder}`,
+                      cursor:"pointer",fontSize:16,transition:"all .15s"}}
+                    onClick={()=>setNewCatIcon(ico)}>{ico}</button>
+                ))}
+              </div>
+            </div>
             <div>
               <div style={{fontSize:11,color:T.textMuted,marginBottom:8,letterSpacing:1}}>RENK</div>
               <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
@@ -1569,11 +1681,12 @@ export default function App() {
                 <label style={{width:28,height:28,borderRadius:"50%",cursor:"pointer",
                   background:`conic-gradient(red,yellow,lime,cyan,blue,magenta,red)`,
                   display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,
-                  border:`2px solid ${T.border}`,overflow:"hidden"}}>
+                  border:`2px solid ${T.border}`,overflow:"hidden",position:"relative"}}>
                   <input type="color" value={newCatColor}
                     onChange={e=>setNewCatColor(e.target.value)}
-                    style={{width:"200%",height:"200%",border:"none",cursor:"pointer",opacity:0,position:"absolute"}}/>
-                  <span style={{pointerEvents:"none"}}>+</span>
+                    style={{position:"absolute",inset:0,width:"100%",height:"100%",
+                      border:"none",cursor:"pointer",opacity:0,padding:0}}/>
+                  <span style={{pointerEvents:"none",position:"relative",zIndex:1}}>+</span>
                 </label>
               </div>
             </div>
@@ -1586,7 +1699,7 @@ export default function App() {
               disabled={!newCatName.trim()}
               onClick={()=>{
                 const id=`cat_${Date.now()}`;
-                const newCat={id,label:newCatName.trim(),icon:"📁",color:newCatColor};
+                const newCat={id,label:newCatName.trim(),icon:newCatIcon,color:newCatColor};
                 const updated=[...customCats,newCat];
                 setCustomCats(updated); localStorage.setItem(SK_CATS,JSON.stringify(updated));
                 setShowAddCat(false); showToast(`"${newCat.label}" eklendi ✓`);
@@ -1596,6 +1709,7 @@ export default function App() {
           </div>
         </div>
       )}
+
 
       {toast&&(
         <div style={{position:"fixed",bottom:24,right:24,color:"#fff",padding:"10px 20px",
@@ -1621,8 +1735,6 @@ const navBtn = (T,active)=>({ display:"flex", alignItems:"center", gap:8, width:
   fontSize:12, fontFamily:"inherit", textAlign:"left", transition:"all .15s" });
 const sectionLabel = T=>({ fontSize:10, fontWeight:700, letterSpacing:2, color:T.textMuted, marginBottom:8 });
 const badge = T=>({ fontSize:10, color:T.textMuted, background:T.inputBg, padding:"1px 6px", borderRadius:10 });
-
-function normalizePhrase(p){ return p.trim().toLowerCase().replace(/\s+/g," "); }
 
 const globalCSS = T=>`
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;600&family=Crimson+Pro:ital,wght@0,400;0,700;1,400&display=swap');
