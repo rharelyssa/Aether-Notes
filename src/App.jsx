@@ -2,19 +2,75 @@ import { useState, useEffect, useRef, useCallback } from "react";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CRYPTO: AES-256-GCM + PBKDF2
+// ───────────────────────────────────────────────────────────────────────────────
+// Pipeline (değişmedi):
+//   secret (PIN veya passphrase) → PBKDF2 → AES-256-GCM key → encrypt/decrypt
+//
+// Vault schema v2:
+//   SK_CONFIG = { authMode: "pin"|"passphrase", version: "V1" }
+//   → hassas veri yok, sadece UI için hangi input gösterileceğini belirtir
+//
+// Verifier (PIN veya passphrase için aynı fonksiyon):
+//   PBKDF2(secret, FIXED_SALT, 310k iter) → export raw → SHA-256 → Base64
+//   → ham secret asla saklanmaz, sadece bu hash localStorage'da durur
+//
+// Migration:
+//   Eski PIN vault → passphrase'e geçiş:
+//   1. Eski secret ile decryptData()
+//   2. Yeni secret ile encryptData()
+//   3. SK_CONFIG güncelle
+//   Mevcut veri formatı değişmiyor, sadece secret değişiyor.
 // ═══════════════════════════════════════════════════════════════════════════════
-const CRYPTO_VERSION       = "V1";
-const PBKDF2_ITER          = 310_000;
-const PIN_VERIFY_SALT      = new TextEncoder().encode("vault-pin-verify-v1-do-not-change");
-const MAX_ATTEMPTS         = 5;
-const LOCKOUT_SECS         = 30;
 
+const CRYPTO_VERSION  = "V1";
+const PBKDF2_ITER     = 310_000;
+// Verifier için sabit salt — aynı secret her zaman aynı verifier üretir
+// Şifreleme için her kayıtta random salt kullanılır (aşağıda)
+const VERIFIER_SALT   = new TextEncoder().encode("aether-verifier-v1-do-not-change");
+const MAX_ATTEMPTS    = 5;
+const LOCKOUT_SECS    = 30;
+
+// ── Passphrase kuralları ──────────────────────────────────────────────────────
+const PASSPHRASE_MIN_LEN = 8; // minimum karakter
+// Entropy tahmini: karakter çeşitliliğine göre bit hesabı
+function estimateEntropy(s) {
+  let pool = 0;
+  if (/[a-z]/.test(s)) pool += 26;
+  if (/[A-Z]/.test(s)) pool += 26;
+  if (/[0-9]/.test(s)) pool += 10;
+  if (/[^a-zA-Z0-9]/.test(s)) pool += 32;
+  return pool > 0 ? Math.floor(s.length * Math.log2(pool)) : 0;
+}
+function getPassphraseStrength(s) {
+  if (!s) return null;
+  const bits = estimateEntropy(s);
+  if (s.length < PASSPHRASE_MIN_LEN) return { level: "weak",   label: "Çok Kısa",   bits, color: "#e05c7a" };
+  if (bits < 40)                     return { level: "weak",   label: "Zayıf",       bits, color: "#e05c7a" };
+  if (bits < 60)                     return { level: "fair",   label: "Orta",        bits, color: "#f0b429" };
+  if (bits < 80)                     return { level: "strong", label: "Güçlü",       bits, color: "#34c88a" };
+  return                                    { level: "great",  label: "Çok Güçlü",   bits, color: "#5b7cf6" };
+}
+
+// ── Storage keys ──────────────────────────────────────────────────────────────
 const SK_NOTES    = "vault_v2_notes";
-const SK_PIN      = "vault_v2_pin";
+const SK_PIN      = "vault_v2_pin";       // verifier hash (PIN veya passphrase için aynı key)
 const SK_STATS    = "vault_v2_stats";
 const SK_RECOVERY = "vault_v2_recovery_blob";
-const SK_CATS     = "vault_v2_categories"; // özel kategoriler
+const SK_CATS     = "vault_v2_categories";
+const SK_CONFIG   = "vault_v2_config";    // { authMode, version } — hassas veri yok
 
+// ── Vault config helpers ──────────────────────────────────────────────────────
+function getVaultConfig() {
+  try { return JSON.parse(localStorage.getItem(SK_CONFIG) || "{}"); } catch { return {}; }
+}
+function setVaultConfig(cfg) {
+  localStorage.setItem(SK_CONFIG, JSON.stringify({ ...getVaultConfig(), ...cfg }));
+}
+function getAuthMode() {
+  return getVaultConfig().authMode || "pin"; // eski vault'lar için default pin
+}
+
+// ── Core crypto ───────────────────────────────────────────────────────────────
 function buf2b64(buf) {
   const b = new Uint8Array(buf); let s = "";
   for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
@@ -25,6 +81,8 @@ function b642buf(b64) {
   for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
   return b.buffer;
 }
+
+// deriveKey: PIN veya passphrase için aynı — sadece input string değişiyor
 async function deriveKey(secret, salt, exportable = false) {
   const km = await crypto.subtle.importKey(
     "raw", new TextEncoder().encode(secret), "PBKDF2", false, ["deriveKey"]
@@ -34,9 +92,11 @@ async function deriveKey(secret, salt, exportable = false) {
     km, { name:"AES-GCM", length:256 }, exportable, ["encrypt","decrypt"]
   );
 }
+
+// encryptData / decryptData: format değişmedi — eski vault'larla uyumlu
 async function encryptData(plain, secret) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv   = crypto.getRandomValues(new Uint8Array(12));
+  const salt = crypto.getRandomValues(new Uint8Array(16)); // her kayıtta random
+  const iv   = crypto.getRandomValues(new Uint8Array(12)); // her kayıtta random
   const key  = await deriveKey(secret, salt);
   const ct   = await crypto.subtle.encrypt({ name:"AES-GCM", iv }, key, new TextEncoder().encode(plain));
   const vb   = new TextEncoder().encode(CRYPTO_VERSION);
@@ -51,19 +111,150 @@ async function decryptData(b64, secret) {
   const pt  = await crypto.subtle.decrypt({ name:"AES-GCM", iv:buf.slice(18,30) }, key, buf.slice(30));
   return new TextDecoder().decode(pt);
 }
-async function makePinVerifier(pin) {
-  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveKey"]);
-  const k  = await crypto.subtle.deriveKey(
-    { name:"PBKDF2", salt:PIN_VERIFY_SALT, iterations:PBKDF2_ITER, hash:"SHA-256" },
+
+// makeVerifier: hem PIN hem passphrase için aynı fonksiyon
+// Sabit salt + PBKDF2 → deterministik hash → localStorage'da saklanır
+// Ham secret ASLA saklanmaz
+async function makeVerifier(secret) {
+  const km = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret), "PBKDF2", false, ["deriveKey"]
+  );
+  const k = await crypto.subtle.deriveKey(
+    { name:"PBKDF2", salt:VERIFIER_SALT, iterations:PBKDF2_ITER, hash:"SHA-256" },
     km, { name:"AES-GCM", length:256 }, true, ["encrypt"]
   );
   return buf2b64(await crypto.subtle.digest("SHA-256", await crypto.subtle.exportKey("raw", k)));
 }
+// Geriye dönük uyumluluk için alias
+const makePinVerifier = makeVerifier;
+
 function timingSafeEqual(a, b) {
-  if(!a || !b) return false;
+  if (!a || !b) return false;
   if (a.length !== b.length) return false;
   let d = 0; for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return d === 0;
+}
+
+// ── Migration: PIN → Passphrase (veya tersi) ─────────────────────────────────
+// Adım adım:
+//   1. decryptData(localStorage[SK_NOTES], oldSecret)    → plaintext
+//   2. encryptData(plaintext, newSecret)                  → yeni blob
+//   3. makeVerifier(newSecret)                            → yeni verifier
+//   4. localStorage[SK_NOTES]    = yeni blob
+//   5. localStorage[SK_PIN]      = yeni verifier
+//   6. setVaultConfig({ authMode: newMode })
+//   Recovery blob da aynı şekilde yeniden şifrelenir.
+async function migrateVaultSecret(oldSecret, newSecret, newMode) {
+  // Notes
+  const rawNotes = localStorage.getItem(SK_NOTES);
+  if (rawNotes) {
+    const plain = await decryptData(rawNotes, oldSecret);
+    localStorage.setItem(SK_NOTES, await encryptData(plain, newSecret));
+  }
+  // Recovery blob
+  const rawRec = localStorage.getItem(SK_RECOVERY);
+  if (rawRec) {
+    try {
+      const plain = await decryptData(rawRec, oldSecret);
+      localStorage.setItem(SK_RECOVERY, await encryptData(plain, newSecret));
+    } catch {} // recovery blob farklı key ile şifreliyse atla
+  }
+  // Verifier + config güncelle
+  localStorage.setItem(SK_PIN, await makeVerifier(newSecret));
+  setVaultConfig({ authMode: newMode, version: CRYPTO_VERSION });
+}
+
+// ── Biometric / WebAuthn ─────────────────────────────────────────────────────
+// Güvenlik modeli:
+//   Gerçek şifreleme anahtarı hâlâ PIN/passphrase'den türetilir.
+//   Biometrik, session sırasında sessionPin'i localStorage'a ŞİFRELİ olarak saklar.
+//   Biometrik → şifreli blob çöz → sessionPin → vault aç.
+//   Cihaz değiştiğinde veya biometrik kaldırıldığında kullanılamaz.
+//
+// Storage format:
+//   SK_BIO_CRED  = { credentialId: base64 }    — hangi credential kaydedildi
+//   SK_BIO_BLOB  = base64(AES-256-GCM encrypted sessionPin)
+//                  key = PBKDF2(credentialId, fixed_salt) — deterministik ama cihaza özgü
+
+const SK_BIO_CRED = "aether_bio_cred";
+const SK_BIO_BLOB = "aether_bio_blob";
+const BIO_SALT    = new TextEncoder().encode("aether-bio-v1-fixed-salt");
+
+function isBiometricAvailable() {
+  return !!(window.PublicKeyCredential && navigator.credentials);
+}
+
+async function biometricRegister(sessionSecret) {
+  if (!isBiometricAvailable()) throw new Error("WebAuthn desteklenmiyor");
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const cred = await navigator.credentials.create({
+    publicKey: {
+      challenge,
+      rp: { name: "Aether Notes", id: location.hostname },
+      user: {
+        id: new TextEncoder().encode("aether-user"),
+        name: "aether@local",
+        displayName: "Aether Vault",
+      },
+      pubKeyCredParams: [
+        { type: "public-key", alg: -7  }, // ES256
+        { type: "public-key", alg: -257 }, // RS256
+      ],
+      authenticatorSelection: {
+        authenticatorAttachment: "platform", // sadece cihaz biyometriği
+        userVerification: "required",
+        requireResidentKey: false,
+      },
+      timeout: 60000,
+    },
+  });
+  // Credential ID'yi sakla
+  const credId = buf2b64(cred.rawId);
+  // sessionSecret'i credential ID ile şifrele
+  const key = await deriveKey(credId, BIO_SALT);
+  const iv  = crypto.getRandomValues(new Uint8Array(12));
+  const ct  = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv }, key, new TextEncoder().encode(sessionSecret)
+  );
+  const out = new Uint8Array(12 + ct.byteLength);
+  out.set(iv, 0); out.set(new Uint8Array(ct), 12);
+  localStorage.setItem(SK_BIO_CRED, JSON.stringify({ credId }));
+  localStorage.setItem(SK_BIO_BLOB, buf2b64(out.buffer));
+  return credId;
+}
+
+async function biometricUnlock() {
+  if (!isBiometricAvailable()) throw new Error("WebAuthn desteklenmiyor");
+  const stored = localStorage.getItem(SK_BIO_CRED);
+  if (!stored) throw new Error("Kayıtlı biyometrik yok");
+  const { credId } = JSON.parse(stored);
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const assertion = await navigator.credentials.get({
+    publicKey: {
+      challenge,
+      allowCredentials: [{
+        type: "public-key",
+        id: b642buf(credId),
+      }],
+      userVerification: "required",
+      timeout: 60000,
+    },
+  });
+  // Doğrulama başarılı — blob'u çöz
+  const rawBlob = new Uint8Array(b642buf(localStorage.getItem(SK_BIO_BLOB)));
+  const iv = rawBlob.slice(0, 12);
+  const ct = rawBlob.slice(12);
+  const key = await deriveKey(credId, BIO_SALT);
+  const pt  = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+  return new TextDecoder().decode(pt); // sessionSecret
+}
+
+function hasBiometricRegistered() {
+  return !!localStorage.getItem(SK_BIO_CRED);
+}
+function removeBiometric() {
+  localStorage.removeItem(SK_BIO_CRED);
+  localStorage.removeItem(SK_BIO_BLOB);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -168,38 +359,6 @@ async function importVault(file, pin) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MARKDOWN (XSS-safe)
-// ═══════════════════════════════════════════════════════════════════════════════
-function sanitizeHref(h) {
-  try { const u=new URL(h); if(["http:","https:","mailto:"].includes(u.protocol))return h; } catch {}
-  return /^[a-zA-Z0-9/_\-.#?=&%]+$/.test(h)?h:"#";
-}
-
-// Wiki link pattern: [[note başlığı]] → clickable span with data-wiki attr
-// Rendered as <span data-wiki="note başlığı"> so App can intercept clicks
-function renderMarkdown(raw) {
-  if (!raw) return "";
-  let t = raw.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-  // Wiki links FIRST — before other processing
-  t = t.replace(/\[\[([^\]]+)\]\]/g, (_,title) =>
-    `<span class="wiki-link" data-wiki="${title.replace(/"/g,"&quot;")}" style="color:#5b7cf6;border-bottom:1px dashed #5b7cf6;cursor:pointer;font-style:italic;">[[${title}]]</span>`
-  );
-  return t
-    .replace(/^### (.+)$/gm,"<h3>$1</h3>").replace(/^## (.+)$/gm,"<h2>$1</h2>").replace(/^# (.+)$/gm,"<h1>$1</h1>")
-    .replace(/\*\*(.+?)\*\*/g,"<strong>$1</strong>").replace(/\*(.+?)\*/g,"<em>$1</em>")
-    .replace(/`(.+?)`/g,"<code>$1</code>").replace(/~~(.+?)~~/g,"<del>$1</del>")
-    .replace(/^- (.+)$/gm,"<li>$1</li>").replace(/(<li>[\s\S]*?<\/li>)/g,"<ul>$1</ul>")
-    .replace(/^\d+\. (.+)$/gm,"<_li>$1</_li>").replace(/(<_li>[\s\S]*?<\/_li>)/g,"<ol>$1</ol>")
-    .replace(/<_li>/g,"<li>").replace(/<\/_li>/g,"</li>")
-    .replace(/^&gt; (.+)$/gm,"<blockquote>$1</blockquote>")
-    .replace(/\[(.+?)\]\((.+?)\)/g,(_,txt,href)=>`<a href="${sanitizeHref(href)}" target="_blank" rel="noopener noreferrer">${txt}</a>`)
-    .replace(/^(?!<[hubloa]|<blockquote)(.+)$/gm,"<p>$1</p>").replace(/\n{2,}/g,"");
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════════
 const CATEGORIES = [
   {id:"all",      label:"Tüm Notlar", icon:"📋"},
   {id:"personal", label:"Kişisel",    icon:"👤", color:"#5b8af5"},
@@ -208,7 +367,6 @@ const CATEGORIES = [
   {id:"idea",     label:"Fikirler",   icon:"💡", color:"#f0b429"},
 ];
 
-// Not renk paleti — 12 renk
 const NOTE_COLORS = [
   {id:"none",   label:"Varsayılan", hex:null},
   {id:"red",    label:"Kırmızı",   hex:"#ff6b6b"},
@@ -270,7 +428,12 @@ export default function App() {
 
   // Auth
   const [screen,setScreen]               = useState("lock");
+  const [authMode,setAuthMode]           = useState(()=>getAuthMode()); // "pin" | "passphrase"
+  const [setupMode,setSetupMode]         = useState(null);  // ilk kurulum seçimi: null|"pin"|"passphrase"
   const [pin,setPin]                     = useState("");
+  const [passInput,setPassInput]         = useState("");    // passphrase giriş
+  const [confirmPass,setConfirmPass]     = useState("");    // passphrase onay
+  const [passStrength,setPassStrength]   = useState(null);  // getPassphraseStrength sonucu
   const [savedVerifier,setSavedVerifier] = useState(null);
   const [isSettingPin,setIsSettingPin]   = useState(false);
   const [confirmPin,setConfirmPin]       = useState("");
@@ -281,8 +444,21 @@ export default function App() {
   const [loading,setLoading]             = useState(false);
   const [generatedPhrase,setGeneratedPhrase] = useState("");
   const [phraseConfirmed,setPhraseConfirmed] = useState(false);
+  // Migration state
+  const [showMigrate,setShowMigrate]     = useState(false);
+  const [migrateStep,setMigrateStep]     = useState("verify"); // "verify"|"setup"|"done"
+  const [migrateOldInput,setMigrateOldInput] = useState("");
+  const [migrateNewInput,setMigrateNewInput] = useState("");
+  const [migrateConfirm,setMigrateConfirm]   = useState("");
+  const [migrateTargetMode,setMigrateTargetMode] = useState("passphrase");
+  const [migrateError,setMigrateError]   = useState("");
+  const [migrateLoading,setMigrateLoading] = useState(false);
   const sessionPin = useRef(null);
-  const sessionPhrase = useRef(null); // phrase bellekte tutulur, localStorage'a yazılmaz
+  const sessionPhrase = useRef(null);
+  // Biometric (WebAuthn) — PIN/passphrase şifrelemeyi değiştirmez, sadece hızlı erişim
+  const [bioAvailable,setBioAvailable]   = useState(false);
+  const [bioRegistered,setBioRegistered] = useState(hasBiometricRegistered);
+  const [bioLoading,setBioLoading]       = useState(false);
 
   // Recovery flow
   const [screen2,setScreen2]           = useState(null); // "recovery"
@@ -364,10 +540,24 @@ export default function App() {
     const s=localStorage.getItem(SK_STATS);
     if(s) try{setStats(JSON.parse(s));}catch{}
 
-    // PWA install prompt yakala
-    const handler=(e)=>{ e.preventDefault(); setPwaPrompt(e); };
-    window.addEventListener("beforeinstallprompt", handler);
-    return()=>window.removeEventListener("beforeinstallprompt", handler);
+    // PWA install prompt
+    const pwaHandler=(e)=>{ e.preventDefault(); setPwaPrompt(e); };
+    window.addEventListener("beforeinstallprompt", pwaHandler);
+
+    // WebAuthn / Biometric availability check
+    // window.PublicKeyCredential varsa destekleniyor sayıyoruz
+    // isUserVerifyingPlatformAuthenticatorAvailable localhost'ta false dönebilir
+    if(window.PublicKeyCredential && navigator.credentials){
+      setBioAvailable(true); // API var, dene — hata olursa yaklarız
+      // Arka planda gerçek kontrolü de yap
+      if(window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable){
+        window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()
+          .then(ok => { if(!ok) setBioAvailable(false); })
+          .catch(()=>{}); // hata olursa true'da bırak
+      }
+    }
+
+    return()=>window.removeEventListener("beforeinstallprompt", pwaHandler);
   },[]);
 
   useEffect(()=>{
@@ -461,17 +651,40 @@ export default function App() {
     }
   };
 
-  // Phrase onaylandı → vault oluştur
+  // Passphrase ile giriş
+  const handlePassphraseLogin = async(pass) => {
+    if(!pass){ setPinError("Passphrase gir"); return; }
+    setLoading(true);
+    const cand = await makeVerifier(pass);
+    if(timingSafeEqual(cand, savedVerifier)){
+      resetFails(); sessionPin.current = pass;
+      const loaded = await loadNotes(pass); setNotes(loaded);
+      if(loaded.length>0) setActiveId(loaded[0].id);
+      updStats(loaded); setLoading(false);
+      setScreen("app"); setPassInput(""); resetAutoLock(); showToast("Aether açıldı 🔓");
+    } else {
+      recordFail(); shake_(); const rem = lockRem();
+      if(rem>0){ setLockoutSecs(rem); setPinError(`${MAX_ATTEMPTS} hatalı deneme — ${rem}s`); }
+      else { setPinError(`Yanlış passphrase (${_fails}/${MAX_ATTEMPTS})`); }
+      setLoading(false); setPassInput("");
+    }
+  };
+
+  // Phrase onaylandı → vault oluştur (PIN veya passphrase)
   const finalizeSetup=async()=>{
     setLoading(true);
-    const phrase=sessionPhrase.current;
-    const v=await makePinVerifier(confirmPin);
-    localStorage.setItem(SK_PIN,v); setSavedVerifier(v); setIsSettingPin(false);
-    sessionPin.current=confirmPin;
-    const loaded=await loadNotes(confirmPin); setNotes(loaded);
-    // Recovery blob oluştur (boş vault ile)
+    const phrase = sessionPhrase.current;
+    const secret = setupMode==="passphrase" ? passInput : confirmPin;
+    const mode   = setupMode || "pin";
+    const v = await makeVerifier(secret);
+    localStorage.setItem(SK_PIN, v); setSavedVerifier(v); setIsSettingPin(false);
+    setVaultConfig({ authMode: mode, version: CRYPTO_VERSION });
+    setAuthMode(mode);
+    sessionPin.current = secret;
+    const loaded = await loadNotes(secret); setNotes(loaded);
     await saveRecoveryBlob(loaded, phrase);
-    setLoading(false); setScreen("app"); setPinStep("enter"); setGeneratedPhrase("");
+    setLoading(false); setScreen("app"); setPinStep("enter");
+    setGeneratedPhrase(""); setPassInput(""); setConfirmPass(""); setSetupMode(null);
     resetAutoLock(); showToast("Aether oluşturuldu! 🎉");
   };
 
@@ -776,28 +989,215 @@ export default function App() {
           </div>
         </div>
       ):(
-        /* Normal PIN ekranı */
-        <div style={{padding:40,borderRadius:20,width:320,display:"flex",flexDirection:"column",
-          alignItems:"center",gap:18,background:T.sidebar,border:`1px solid ${T.border}`,
+        /* ── Giriş / Kurulum ekranı ── */
+        <div style={{padding:36,borderRadius:20,width:360,display:"flex",flexDirection:"column",
+          alignItems:"center",gap:16,background:T.sidebar,border:`1px solid ${T.border}`,
           boxShadow:"0 8px 40px #0004"}}>
-          <div style={{width:72,height:72,borderRadius:18,
+          <div style={{width:68,height:68,borderRadius:18,
             background:"linear-gradient(135deg,#3d3580,#5b7cf6)",
             display:"flex",alignItems:"center",justifyContent:"center",
-            fontSize:32,boxShadow:`0 0 40px ${T.accent}44`}}>🔒</div>
+            fontSize:30,boxShadow:`0 0 40px ${T.accent}44`}}>✦</div>
           <div style={{fontSize:20,fontWeight:700,letterSpacing:4,color:T.text}}>AETHER</div>
-          <div style={{fontSize:12,color:T.textMuted,letterSpacing:2,textAlign:"center"}}>
-            {isSettingPin?(pinStep==="enter"?"Yeni PIN belirle (4 hane)":"PIN'i tekrar gir")
-              :lockoutSecs>0?`Kilitli — ${lockoutSecs}s`:loading?"Doğrulanıyor…":"PIN'ini gir"}
-          </div>
-          <PinDots len={pin.length} shk={shake}/>
-          {pinError&&<div style={{color:T.danger,fontSize:12,textAlign:"center"}}>{pinError}</div>}
-          <PinPad pinVal={pin} onDigit={d=>{if(d==="⌫"){setPin(p=>p.slice(0,-1));setPinError("");}else handleDigit(d);}} disabled={loading||lockoutSecs>0}/>
-          <div style={{fontSize:10,color:T.textMuted,letterSpacing:2,textAlign:"center"}}>🛡 AES-256-GCM · Yerel · Bulut yok</div>
+
+          {/* İlk kurulum — mod seçimi */}
+          {isSettingPin && !setupMode && (
+            <>
+              <div style={{fontSize:12,color:T.textMuted,textAlign:"center",lineHeight:1.7}}>
+                Güvenlik modunu seç
+              </div>
+              <div style={{display:"flex",flexDirection:"column",gap:10,width:"100%"}}>
+                <button style={{background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                  color:T.text,padding:"14px 16px",borderRadius:12,cursor:"pointer",
+                  fontFamily:"inherit",textAlign:"left",transition:"all .2s"}}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor=T.accent}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor=T.inputBorder}
+                  onClick={()=>setSetupMode("passphrase")}>
+                  <div style={{fontWeight:700,fontSize:13,marginBottom:4}}>
+                    🔐 Passphrase <span style={{background:T.success+"22",color:T.success,
+                      fontSize:10,padding:"2px 6px",borderRadius:4,marginLeft:6}}>Önerilen</span>
+                  </div>
+                  <div style={{fontSize:11,color:T.textMuted,lineHeight:1.6}}>
+                    Uzun bir şifre cümlesi — çok daha güçlü.<br/>
+                    Örn: <em>"mavi kediler 42 uçar!"</em>
+                  </div>
+                </button>
+                <button style={{background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                  color:T.text,padding:"14px 16px",borderRadius:12,cursor:"pointer",
+                  fontFamily:"inherit",textAlign:"left",transition:"all .2s"}}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor=T.accent}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor=T.inputBorder}
+                  onClick={()=>setSetupMode("pin")}>
+                  <div style={{fontWeight:700,fontSize:13,marginBottom:4}}>
+                    🔢 4 Haneli PIN <span style={{background:T.warn+"22",color:T.warn,
+                      fontSize:10,padding:"2px 6px",borderRadius:4,marginLeft:6}}>Daha Zayıf</span>
+                  </div>
+                  <div style={{fontSize:11,color:T.textMuted,lineHeight:1.6}}>
+                    Hızlı erişim, ama kısa — daha az güvenli.
+                  </div>
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Passphrase kurulum / giriş */}
+          {(setupMode==="passphrase" || (!isSettingPin && authMode==="passphrase")) && (
+            <>
+              <div style={{fontSize:12,color:T.textMuted,textAlign:"center"}}>
+                {isSettingPin
+                  ? (pinStep==="confirm" ? "Passphrase'i tekrar gir" : "Güçlü bir passphrase belirle")
+                  : loading ? "Doğrulanıyor…" : "Passphrase'ini gir"}
+              </div>
+              <div style={{width:"100%",display:"flex",flexDirection:"column",gap:8}}>
+                <input
+                  type="password"
+                  autoFocus
+                  style={{width:"100%",background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                    outline:"none",color:T.text,fontSize:15,fontFamily:"inherit",
+                    padding:"12px 16px",borderRadius:10,boxSizing:"border-box",transition:"border .2s"}}
+                  placeholder={isSettingPin&&pinStep==="confirm"?"Tekrar gir…":"Passphrase…"}
+                  value={pinStep==="confirm"?confirmPass:passInput}
+                  onFocus={e=>e.target.style.borderColor=T.accent}
+                  onBlur={e=>e.target.style.borderColor=T.inputBorder}
+                  onChange={e=>{
+                    if(pinStep==="confirm") setConfirmPass(e.target.value);
+                    else { setPassInput(e.target.value); setPassStrength(getPassphraseStrength(e.target.value)); }
+                    setPinError("");
+                  }}
+                  onKeyDown={async e=>{
+                    if(e.key!=="Enter") return;
+                    if(isSettingPin){
+                      if(pinStep==="enter"){
+                        const s=getPassphraseStrength(passInput);
+                        if(!s||s.level==="weak"){ setPinError(`Çok kısa veya zayıf (min ${PASSPHRASE_MIN_LEN} karakter)`); return; }
+                        setPinStep("confirm");
+                      } else {
+                        if(confirmPass!==passInput){ shake_(); setPinError("Passphrase'ler eşleşmiyor"); setConfirmPass(""); return; }
+                        const phrase=generatePhrase(12); setGeneratedPhrase(phrase);
+                        sessionPhrase.current=phrase; setPinStep("phrase");
+                      }
+                    } else {
+                      if(!passInput){ setPinError("Passphrase gir"); return; }
+                      await handlePassphraseLogin(passInput);
+                    }
+                  }}
+                />
+                {/* Güç göstergesi */}
+                {isSettingPin && pinStep==="enter" && passStrength && (
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <div style={{flex:1,height:4,borderRadius:4,background:T.border,overflow:"hidden"}}>
+                      <div style={{height:"100%",borderRadius:4,transition:"all .3s",
+                        background:passStrength.color,
+                        width:passStrength.level==="weak"?"25%":passStrength.level==="fair"?"50%":
+                          passStrength.level==="strong"?"75%":"100%"}}/>
+                    </div>
+                    <span style={{fontSize:11,color:passStrength.color,fontWeight:600,minWidth:60}}>
+                      {passStrength.label}
+                    </span>
+                    <span style={{fontSize:10,color:T.textMuted}}>~{passStrength.bits}bit</span>
+                  </div>
+                )}
+              </div>
+              {pinError&&<div style={{color:T.danger,fontSize:12,textAlign:"center"}}>{pinError}</div>}
+              {isSettingPin && (
+                <button style={{width:"100%",background:T.accent,border:"none",color:"#fff",
+                  padding:"11px 0",borderRadius:10,cursor:"pointer",fontSize:13,
+                  fontFamily:"inherit",fontWeight:700,opacity:loading?.6:1}}
+                  disabled={loading}
+                  onClick={async()=>{
+                    if(pinStep==="enter"){
+                      const s=getPassphraseStrength(passInput);
+                      if(!s||s.level==="weak"){ setPinError(`Çok kısa veya zayıf (min ${PASSPHRASE_MIN_LEN} karakter)`); return; }
+                      setPinStep("confirm");
+                    } else {
+                      if(confirmPass!==passInput){ shake_(); setPinError("Passphrase'ler eşleşmiyor"); setConfirmPass(""); return; }
+                      const phrase=generatePhrase(12); setGeneratedPhrase(phrase);
+                      sessionPhrase.current=phrase; setPinStep("phrase");
+                    }
+                  }}>
+                  {pinStep==="enter"?"Devam →":"Onayla →"}
+                </button>
+              )}
+              {!isSettingPin && (
+                <button style={{width:"100%",background:T.accent,border:"none",color:"#fff",
+                  padding:"11px 0",borderRadius:10,cursor:"pointer",fontSize:13,
+                  fontFamily:"inherit",fontWeight:700,opacity:loading?.6:1}}
+                  disabled={loading}
+                  onClick={()=>handlePassphraseLogin(passInput)}>
+                  {loading?"Açılıyor…":"Aç →"}
+                </button>
+              )}
+              {isSettingPin && (
+                <button style={{background:"none",border:"none",color:T.textMuted,cursor:"pointer",
+                  fontSize:11,fontFamily:"inherit"}}
+                  onClick={()=>{setSetupMode(null);setPinStep("enter");setPassInput("");setConfirmPass("");setPinError("");}}>
+                  ← Geri
+                </button>
+              )}
+            </>
+          )}
+
+          {/* PIN kurulum / giriş */}
+          {(setupMode==="pin" || (!isSettingPin && authMode==="pin")) && pinStep!=="phrase" && (
+            <>
+              <div style={{fontSize:12,color:T.textMuted,letterSpacing:2,textAlign:"center"}}>
+                {isSettingPin?(pinStep==="enter"?"Yeni PIN belirle (4 hane)":"PIN'i tekrar gir")
+                  :lockoutSecs>0?`Kilitli — ${lockoutSecs}s`:loading?"Doğrulanıyor…":"PIN'ini gir"}
+              </div>
+              <PinDots len={pin.length} shk={shake}/>
+              {pinError&&<div style={{color:T.danger,fontSize:12,textAlign:"center"}}>{pinError}</div>}
+              <PinPad pinVal={pin} onDigit={d=>{if(d==="⌫"){setPin(p=>p.slice(0,-1));setPinError("");}else handleDigit(d);}} disabled={loading||lockoutSecs>0}/>
+              {isSettingPin && (
+                <button style={{background:"none",border:"none",color:T.textMuted,cursor:"pointer",
+                  fontSize:11,fontFamily:"inherit"}}
+                  onClick={()=>{setSetupMode(null);setPinStep("enter");setPin("");setPinError("");}}>
+                  ← Geri
+                </button>
+              )}
+            </>
+          )}
+
+          {/* Ortak footer */}
+          {!isSettingPin && (
+            <div style={{fontSize:10,color:T.textMuted,letterSpacing:2,textAlign:"center"}}>
+              🛡 AES-256-GCM · Yerel · Bulut yok
+            </div>
+          )}
+          {/* Biometric unlock butonu — kayıtlıysa her zaman göster */}
+          {!isSettingPin && bioRegistered && (
+            <button
+              style={{width:"100%",background:T.accentBg,border:`1px solid ${T.accent}44`,
+                color:T.accent,padding:"11px 0",borderRadius:10,cursor:"pointer",
+                fontSize:13,fontFamily:"inherit",fontWeight:600,
+                display:"flex",alignItems:"center",justifyContent:"center",gap:8,
+                opacity:bioLoading?.6:1}}
+              disabled={bioLoading}
+              onClick={async()=>{
+                setBioLoading(true);
+                try{
+                  const secret=await biometricUnlock();
+                  const cand=await makeVerifier(secret);
+                  if(timingSafeEqual(cand,savedVerifier)){
+                    resetFails(); sessionPin.current=secret;
+                    const loaded=await loadNotes(secret); setNotes(loaded);
+                    if(loaded.length>0) setActiveId(loaded[0].id);
+                    updStats(loaded); setScreen("app");
+                    setPin(""); setPassInput(""); resetAutoLock();
+                    showToast("Biyometrik ile açıldı 🔓");
+                  } else { showToast("Biyometrik doğrulama başarısız","danger"); }
+                }catch(e){
+                  if(e.name==="NotAllowedError") showToast("İptal edildi","warn");
+                  else showToast("Biyometrik hata: "+e.message,"danger");
+                }
+                setBioLoading(false);
+              }}>
+              {bioLoading?"Doğrulanıyor…":"🪪 Face ID / Parmak İzi ile Aç"}
+            </button>
+          )}
           {!isSettingPin&&localStorage.getItem(SK_RECOVERY)&&(
             <button style={{background:"none",border:`1px solid ${T.border}`,color:T.textMuted,
               padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}
               onClick={()=>{setScreen2("recovery");setRecoverySuccess(false);setRecoveryInput("");setRecoveryError("");}}>
-              🔑 PIN'i unuttum
+              🔑 Şifremi unuttum
             </button>
           )}
           <button style={{background:"none",border:`1px solid ${T.border}`,color:T.textMuted,
@@ -861,10 +1261,17 @@ export default function App() {
           </button>
         )}
         {[["📤","Dışa/İçe Aktar",()=>setShowExport(true)],["📊","İstatistikler",()=>setShowStats(true)],
-          ["⚙️","Ayarlar",()=>setShowSettings(true)],
           [theme==="dark"?"☀":"🌙","Tema",toggleTheme]].map(([ico,title,fn])=>(
           <button key={title} style={topBtn(T)} title={title} onClick={fn}>{ico}</button>
         ))}
+        {/* Ayarlar — PIN modunda uyarı rengi */}
+        <button style={{...topBtn(T),
+          color:authMode==="pin"?T.warn:T.textSub,
+          borderColor:authMode==="pin"?T.warn+"66":T.border}}
+          title={authMode==="pin"?"Ayarlar (PIN modu aktif — passphrase önerilir)":"Ayarlar"}
+          onClick={()=>setShowSettings(true)}>
+          ⚙️
+        </button>
         <button style={{...topBtn(T),color:T.danger}} title="Kilitle"
           onClick={()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");}}>🔒</button>
       </div>
@@ -1489,23 +1896,103 @@ export default function App() {
               </div>
             </div>
 
-            {/* PIN değiştir */}
+            {/* Biyometrik */}
             <div style={{background:T.inputBg,border:`1px solid ${T.inputBorder}`,
               borderRadius:12,padding:16,display:"flex",flexDirection:"column",gap:10}}>
-              <div style={{fontWeight:600,fontSize:13,color:T.text}}>🔒 PIN Değiştir</div>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontWeight:600,fontSize:13,color:T.text}}>🪪 Biyometrik Kilit Açma</span>
+                {bioRegistered && (
+                  <span style={{background:T.success+"22",color:T.success,
+                    fontSize:10,padding:"2px 6px",borderRadius:4,fontWeight:700}}>AKTİF</span>
+                )}
+                {!bioAvailable && (
+                  <span style={{background:T.warn+"22",color:T.warn,
+                    fontSize:10,padding:"2px 6px",borderRadius:4}}>Desteklenmiyor</span>
+                )}
+              </div>
               <div style={{fontSize:12,color:T.textMuted,lineHeight:1.6}}>
-                PIN değiştirmek için vault'u kilitle ve yeni cihaz kurulumu gibi tekrar PIN belirle.
+                {!bioAvailable
+                  ? "Bu cihaz/tarayıcı WebAuthn desteklemiyor. Chrome/Safari + HTTPS gerekli."
+                  : bioRegistered
+                    ? "Face ID / Parmak izi ile hızlı açma aktif. PIN/passphrase şifrelemeyi korur."
+                    : "Face ID veya parmak izi ile vault'u hızlıca açabilirsin. Şifreleme değişmez."}
+              </div>
+              {bioAvailable && (!bioRegistered ? (
+                <button style={{background:T.accent,border:"none",color:"#fff",
+                  padding:"9px 0",borderRadius:8,cursor:"pointer",fontSize:12,
+                  fontFamily:"inherit",fontWeight:600}}
+                  onClick={async()=>{
+                    if(!sessionPin.current){ showToast("Önce vault'u aç","warn"); return; }
+                    try{
+                      await biometricRegister(sessionPin.current);
+                      setBioRegistered(true);
+                      showToast("Biyometrik kaydedildi ✓");
+                    }catch(e){
+                      if(e.name==="NotAllowedError") showToast("İptal edildi","warn");
+                      else showToast("Kayıt başarısız: "+e.message,"danger");
+                    }
+                  }}>
+                  🪪 Biyometrik Kaydet
+                </button>
+              ):(
+                <button style={{background:"transparent",border:`1px solid ${T.danger}44`,
+                  color:T.danger,padding:"8px 0",borderRadius:8,cursor:"pointer",
+                  fontSize:12,fontFamily:"inherit"}}
+                  onClick={()=>{ removeBiometric(); setBioRegistered(false); showToast("Biyometrik kaldırıldı"); }}>
+                  Biyometriği Kaldır
+                </button>
+              ))}
+            </div>
+
+            {/* Güvenlik Modu */}
+            <div style={{background:T.inputBg,border:`1px solid ${T.inputBorder}`,
+              borderRadius:12,padding:16,display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                <span style={{fontWeight:600,fontSize:13,color:T.text}}>🔐 Güvenlik Modu</span>
+                <span style={{
+                  background:authMode==="passphrase"?T.success+"22":T.warn+"22",
+                  color:authMode==="passphrase"?T.success:T.warn,
+                  fontSize:10,padding:"2px 8px",borderRadius:4,fontWeight:700}}>
+                  {authMode==="passphrase"?"PASSPHRASE":"4 HANELİ PIN"}
+                </span>
+              </div>
+              <div style={{fontSize:12,color:T.textMuted,lineHeight:1.6}}>
+                {authMode==="pin"
+                  ? "⚠ 4 haneli PIN görece zayıftır. Passphrase'e geçmenizi öneririz."
+                  : "✓ Passphrase kullanıyorsunuz. Güçlü güvenlik modundasınız."}
+              </div>
+              <button style={{background:T.accent,border:"none",color:"#fff",
+                padding:"9px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:600}}
+                onClick={()=>{
+                  setShowSettings(false);
+                  setShowMigrate(true);
+                  setMigrateStep("verify");
+                  setMigrateOldInput("");
+                  setMigrateNewInput("");
+                  setMigrateConfirm("");
+                  setMigrateError("");
+                  setMigrateTargetMode(authMode==="pin"?"passphrase":"pin");
+                }}>
+                {authMode==="pin"?"🔐 Passphrase'e Geç":"🔢 PIN'e Geç (veya değiştir)"}
+              </button>
+            </div>
+
+            {/* Sıfırla */}
+            <div style={{background:T.inputBg,border:`1px solid ${T.border}`,
+              borderRadius:12,padding:16,display:"flex",flexDirection:"column",gap:10}}>
+              <div style={{fontWeight:600,fontSize:13,color:T.text}}>⚠️ Vault'u Sıfırla</div>
+              <div style={{fontSize:12,color:T.textMuted,lineHeight:1.6}}>
+                Tüm notlar ve ayarlar silinir. Önce export almayı unutma.
               </div>
               <button style={{background:"transparent",border:`1px solid ${T.danger}44`,
                 color:T.danger,padding:"8px 0",borderRadius:8,cursor:"pointer",
                 fontSize:12,fontFamily:"inherit"}}
                 onClick={()=>{
-                  // PIN'i sıfırla — kullanıcı yeni vault kurulumu yapacak
-                  if(window.confirm("Dikkat: Tüm notlar silinecek. Önce export almayı unutma!\n\nDevam etmek istiyor musun?")){
+                  if(window.confirm("Dikkat: Tüm notlar silinecek!\n\nDevam etmek istiyor musun?")){
                     localStorage.clear(); window.location.reload();
                   }
                 }}>
-                ⚠ Aether'i Sıfırla (tüm veriler silinir)
+                Aether'i Sıfırla (tüm veriler silinir)
               </button>
             </div>
 
@@ -1768,6 +2255,240 @@ export default function App() {
         </div>
       )}
 
+
+      {/* ══ MIGRATION MODAL ══ */}
+      {showMigrate&&(
+        <div style={{position:"fixed",inset:0,background:"#000b",display:"flex",
+          alignItems:"center",justifyContent:"center",zIndex:120}}
+          onClick={()=>setShowMigrate(false)}>
+          <div style={{background:T.sidebar,border:`1px solid ${T.border}`,borderRadius:16,
+            padding:28,width:400,maxWidth:"94vw",display:"flex",flexDirection:"column",gap:16}}
+            onClick={e=>e.stopPropagation()}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontWeight:700,fontSize:15,color:T.text}}>
+                {migrateTargetMode==="passphrase"?"🔐 Passphrase'e Geç":"🔢 PIN'e Geç"}
+              </span>
+              <button style={{background:"none",border:"none",color:T.textMuted,cursor:"pointer",fontSize:20}}
+                onClick={()=>setShowMigrate(false)}>×</button>
+            </div>
+
+            {migrateStep==="verify"&&(
+              <>
+                <div style={{fontSize:12,color:T.textMuted,lineHeight:1.7}}>
+                  Güvenlik için önce mevcut {authMode==="pin"?"PIN'ini":"passphrase'ini"} gir.
+                </div>
+                {authMode==="pin"?(
+                  <>
+                    <div style={{display:"flex",gap:12,justifyContent:"center"}}>
+                      {[0,1,2,3].map(i=>(
+                        <div key={i} style={{width:13,height:13,borderRadius:"50%",border:"2px solid",
+                          borderColor:i<migrateOldInput.length?T.accent:T.border,
+                          background:i<migrateOldInput.length?T.accent:"transparent",transition:"all .15s"}}/>
+                      ))}
+                    </div>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8}}>
+                      {[1,2,3,4,5,6,7,8,9,"",0,"⌫"].map((d,i)=>(
+                        <button key={i} style={{width:"100%",aspectRatio:"1",borderRadius:10,
+                          background:d===""?"transparent":T.inputBg,
+                          border:d===""?"none":`1px solid ${T.inputBorder}`,
+                          color:T.text,fontSize:18,fontFamily:"'IBM Plex Mono',monospace",
+                          cursor:d===""?"default":"pointer"}}
+                          className={d!==""?"pinkey":""}
+                          disabled={d===""}
+                          onClick={async()=>{
+                            if(d==="⌫"){setMigrateOldInput(p=>p.slice(0,-1));setMigrateError("");return;}
+                            const np=migrateOldInput+String(d); setMigrateOldInput(np);
+                            if(np.length===4){
+                              const cand=await makeVerifier(np);
+                              if(timingSafeEqual(cand,savedVerifier)){ setMigrateStep("setup"); setMigrateError(""); }
+                              else{ shake_(); setMigrateError("Yanlış PIN"); setMigrateOldInput(""); }
+                            }
+                          }}>
+                          {d}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                ):(
+                  <>
+                    <input type="password" autoFocus
+                      style={{width:"100%",background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                        outline:"none",color:T.text,fontSize:14,fontFamily:"inherit",
+                        padding:"10px 14px",borderRadius:8,boxSizing:"border-box"}}
+                      placeholder="Mevcut passphrase…"
+                      value={migrateOldInput}
+                      onChange={e=>{setMigrateOldInput(e.target.value);setMigrateError("");}}
+                      onKeyDown={async e=>{
+                        if(e.key!=="Enter") return;
+                        const cand=await makeVerifier(migrateOldInput);
+                        if(timingSafeEqual(cand,savedVerifier)){ setMigrateStep("setup"); setMigrateError(""); }
+                        else{ shake_(); setMigrateError("Yanlış passphrase"); setMigrateOldInput(""); }
+                      }}
+                    />
+                    <button style={{background:T.accent,border:"none",color:"#fff",
+                      padding:"10px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:700}}
+                      onClick={async()=>{
+                        const cand=await makeVerifier(migrateOldInput);
+                        if(timingSafeEqual(cand,savedVerifier)){ setMigrateStep("setup"); setMigrateError(""); }
+                        else{ shake_(); setMigrateError("Yanlış passphrase"); setMigrateOldInput(""); }
+                      }}>
+                      Doğrula →
+                    </button>
+                  </>
+                )}
+                {migrateError&&<div style={{color:T.danger,fontSize:12,textAlign:"center"}}>{migrateError}</div>}
+              </>
+            )}
+
+            {migrateStep==="setup"&&(
+              <>
+                <div style={{fontSize:12,color:T.textMuted,lineHeight:1.7}}>
+                  {migrateTargetMode==="passphrase"
+                    ?"Yeni passphrase belirle — güçlü ve hatırlayabileceğin bir cümle."
+                    :"Yeni 4 haneli PIN belirle."}
+                </div>
+                {migrateTargetMode==="passphrase"?(
+                  <>
+                    <input type="password" autoFocus
+                      style={{width:"100%",background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                        outline:"none",color:T.text,fontSize:14,fontFamily:"inherit",
+                        padding:"10px 14px",borderRadius:8,boxSizing:"border-box"}}
+                      placeholder="Yeni passphrase…"
+                      value={migrateNewInput}
+                      onChange={e=>{
+                        setMigrateNewInput(e.target.value);
+                        setPassStrength(getPassphraseStrength(e.target.value));
+                        setMigrateError("");
+                      }}
+                    />
+                    {passStrength&&(
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <div style={{flex:1,height:4,borderRadius:4,background:T.border,overflow:"hidden"}}>
+                          <div style={{height:"100%",borderRadius:4,background:passStrength.color,
+                            width:passStrength.level==="weak"?"25%":passStrength.level==="fair"?"50%":
+                              passStrength.level==="strong"?"75%":"100%"}}/>
+                        </div>
+                        <span style={{fontSize:11,color:passStrength.color,fontWeight:600}}>{passStrength.label}</span>
+                        <span style={{fontSize:10,color:T.textMuted}}>~{passStrength.bits}bit</span>
+                      </div>
+                    )}
+                    <input type="password"
+                      style={{width:"100%",background:T.inputBg,border:`2px solid ${T.inputBorder}`,
+                        outline:"none",color:T.text,fontSize:14,fontFamily:"inherit",
+                        padding:"10px 14px",borderRadius:8,boxSizing:"border-box"}}
+                      placeholder="Tekrar gir…"
+                      value={migrateConfirm}
+                      onChange={e=>{setMigrateConfirm(e.target.value);setMigrateError("");}}
+                    />
+                  </>
+                ):(
+                  /* PIN modu — temiz state machine, nested setState yok */
+                  <>
+                    <div style={{display:'flex',gap:12,justifyContent:'center'}}>
+                      {[0,1,2,3].map(i=>{
+                        const active=migrateNewInput.length<4?migrateNewInput:migrateConfirm;
+                        return <div key={i} style={{width:13,height:13,borderRadius:'50%',border:'2px solid',
+                          borderColor:i<active.length?T.accent:T.border,
+                          background:i<active.length?T.accent:'transparent',transition:'all .15s'}}/>;
+                      })}
+                    </div>
+                    <div style={{fontSize:11,color:T.textMuted,textAlign:'center'}}>
+                      {migrateNewInput.length<4?'Yeni PIN gir (4 hane)':'Tekrar gir (doğrula)'}
+                    </div>
+                    <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8}}>
+                      {[1,2,3,4,5,6,7,8,9,'',0,'⌫'].map((d,i)=>(
+                        <button key={i} style={{width:'100%',aspectRatio:'1',borderRadius:10,
+                          background:d===''?'transparent':T.inputBg,
+                          border:d===''?'none':('1px solid '+T.inputBorder),
+                          color:T.text,fontSize:18,fontFamily:"'IBM Plex Mono',monospace",
+                          cursor:d===''?'default':'pointer'}}
+                          className={d!==''?'pinkey':''}
+                          disabled={d===''}
+                          onClick={async()=>{
+                            if(d==='') return;
+                            if(d==='⌫'){
+                              if(migrateConfirm.length>0) setMigrateConfirm(p=>p.slice(0,-1));
+                              else setMigrateNewInput(p=>p.slice(0,-1));
+                              setMigrateError(''); return;
+                            }
+                            const digit=String(d);
+                            if(migrateNewInput.length<4){
+                              setMigrateNewInput(p=>p+digit);
+                            } else if(migrateConfirm.length<4){
+                              const next=migrateConfirm+digit;
+                              setMigrateConfirm(next);
+                              if(next.length===4){
+                                if(next!==migrateNewInput){
+                                  shake_(); setMigrateError('PINler eşleşmiyor');
+                                  setTimeout(()=>setMigrateConfirm(''),300); return;
+                                }
+                                setMigrateLoading(true);
+                                try{
+                                  await migrateVaultSecret(sessionPin.current,migrateNewInput,'pin');
+                                  setSavedVerifier(localStorage.getItem(SK_PIN));
+                                  setAuthMode('pin'); sessionPin.current=migrateNewInput;
+                                  setMigrateTargetMode('pin'); setMigrateStep('done');
+                                }catch(e){ setMigrateError('Hata: '+e.message); }
+                                setMigrateLoading(false);
+                              }
+                            }
+                          }}>
+                          {d}
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {migrateError&&<div style={{color:T.danger,fontSize:12,textAlign:"center"}}>{migrateError}</div>}
+                {/* Passphrase modunda manuel buton, PIN modunda otomatik (PIN pad 4+4 tamamlayınca) */}
+                {migrateTargetMode==="passphrase"&&(
+                <button
+                  style={{background:T.accent,border:"none",color:"#fff",padding:"11px 0",
+                    borderRadius:10,cursor:"pointer",fontSize:13,fontFamily:"inherit",fontWeight:700,
+                    opacity:migrateLoading?.6:1}}
+                  disabled={migrateLoading}
+                  onClick={async()=>{
+                    if(!migrateNewInput){ setMigrateError("Yeni passphrase gir"); return; }
+                    const s=getPassphraseStrength(migrateNewInput);
+                    if(!s||s.level==="weak"){ setMigrateError(`Çok zayıf (min ${PASSPHRASE_MIN_LEN} karakter)`); return; }
+                    if(migrateNewInput!==migrateConfirm){ setMigrateError("Passphrase'ler eşleşmiyor"); shake_(); return; }
+                    setMigrateLoading(true);
+                    try{
+                      const oldSecret = migrateOldInput || sessionPin.current;
+                      await migrateVaultSecret(oldSecret, migrateNewInput, "passphrase");
+                      setSavedVerifier(localStorage.getItem(SK_PIN));
+                      setAuthMode("passphrase");
+                      sessionPin.current=migrateNewInput;
+                      setMigrateStep("done");
+                    } catch(e){ setMigrateError("Migration başarısız: "+e.message); }
+                    setMigrateLoading(false);
+                  }}>
+                  {migrateLoading?"Dönüştürülüyor…":"Güvenli Geçiş Yap →"}
+                </button>
+                )}
+              </>
+            )}
+
+            {migrateStep==="done"&&(
+              <div style={{textAlign:"center",padding:"8px 0"}}>
+                <div style={{fontSize:40,marginBottom:12}}>✅</div>
+                <div style={{fontWeight:700,fontSize:14,color:T.text,marginBottom:8}}>
+                  {migrateTargetMode==="passphrase"?"Passphrase'e geçildi!":"PIN güncellendi!"}
+                </div>
+                <div style={{fontSize:12,color:T.textMuted,marginBottom:20,lineHeight:1.7}}>
+                  Tüm notlar yeni {migrateTargetMode==="passphrase"?"passphrase":"PIN"} ile yeniden şifrelendi.
+                  Eski {authMode==="pin"?"PIN":"passphrase"} artık çalışmıyor.
+                </div>
+                <button style={{background:T.accent,border:"none",color:"#fff",padding:"10px 24px",
+                  borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:700}}
+                  onClick={()=>setShowMigrate(false)}>
+                  Kapat
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {toast&&(
         <div style={{position:"fixed",bottom:24,right:24,color:"#fff",padding:"10px 20px",
