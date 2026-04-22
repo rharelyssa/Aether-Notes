@@ -158,9 +158,8 @@ Access via the **⚙️** button in the top bar:
 
 - [ ] Note graph view (visualize wiki links)
 - [ ] Quick capture — jot a note without unlocking
-- [ ] Writing goals — daily word count targets
 - [ ] Advanced search syntax (`tag:work date:today`)
-- [ ] Note templates
+- [ ] Security updates
 - [ ] Configurable auto-lock timeout
 - [ ] Multiple vaults
 - [ ] Import from Markdown files
