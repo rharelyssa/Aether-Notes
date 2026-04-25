@@ -52,14 +52,116 @@ function getPassphraseStrength(s) {
 }
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
+// Bunlar hem localStorage (eski) hem IndexedDB (yeni) için aynı key'ler.
+// Sensitive data (notes, recovery) → IndexedDB encrypted blob
+// Non-sensitive (theme, stats, categories, config) → localStorage (küçük, senkron)
 const SK_NOTES    = "vault_v2_notes";
-const SK_PIN      = "vault_v2_pin";       // verifier hash (PIN veya passphrase için aynı key)
+const SK_PIN      = "vault_v2_pin";
 const SK_STATS    = "vault_v2_stats";
 const SK_RECOVERY = "vault_v2_recovery_blob";
 const SK_CATS     = "vault_v2_categories";
-const SK_CONFIG   = "vault_v2_config";    // { authMode, version } — hassas veri yok
+const SK_CONFIG   = "vault_v2_config";
+const SK_BIO_CRED = "aether_bio_cred";
+const SK_BIO_BLOB = "aether_bio_blob";
+const BIO_SALT    = new TextEncoder().encode("aether-bio-v1-fixed-salt");
 
-// ── Vault config helpers ──────────────────────────────────────────────────────
+// ── IndexedDB wrapper ─────────────────────────────────────────────────────────
+// Güvenlik kararı: Sadece şifreli blob'ları IndexedDB'de saklıyoruz.
+// Plaintext asla yazılmıyor. Tüm şifreleme/çözme bellek içinde gerçekleşiyor.
+// API: getVault(key), setVault(key, value), clearVault(), hasVault(key)
+const IDB_NAME    = "aether-vault";
+const IDB_STORE   = "blobs";
+const IDB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: "key" });
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function getVault(key) {
+  try {
+    const db  = await openDB();
+    const tx  = db.transaction(IDB_STORE, "readonly");
+    const req = tx.objectStore(IDB_STORE).get(key);
+    return new Promise((resolve) => {
+      req.onsuccess = () => resolve(req.result?.value ?? null);
+      req.onerror   = () => resolve(null);
+    });
+  } catch { return null; }
+}
+
+async function setVault(key, value) {
+  try {
+    const db  = await openDB();
+    const tx  = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).put({ key, value });
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve(true);
+      tx.onerror    = () => reject(tx.error);
+    });
+  } catch { return false; }
+}
+
+async function removeVault(key) {
+  try {
+    const db  = await openDB();
+    const tx  = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).delete(key);
+    return new Promise(resolve => { tx.oncomplete = ()=>resolve(true); tx.onerror=()=>resolve(false); });
+  } catch { return false; }
+}
+
+async function hasVault(key) {
+  const val = await getVault(key);
+  return val !== null;
+}
+
+async function clearVault() {
+  try {
+    const db  = await openDB();
+    const tx  = db.transaction(IDB_STORE, "readwrite");
+    tx.objectStore(IDB_STORE).clear();
+    return new Promise(resolve => { tx.oncomplete=()=>resolve(true); tx.onerror=()=>resolve(false); });
+  } catch { return false; }
+}
+
+// ── localStorage → IndexedDB migration ───────────────────────────────────────
+// İlk yüklemede: localStorage'daki şifreli blob'ları IndexedDB'ye kopyala, sil.
+// Veri kaybı yok: kopyalama başarılıysa eski key silinir.
+// Sensitive olmayan key'ler (theme, stats, cats, config) localStorage'da kalır.
+async function migrateFromLocalStorage() {
+  const sensitiveKeys = [SK_NOTES, SK_PIN, SK_RECOVERY, SK_BIO_BLOB];
+  for (const key of sensitiveKeys) {
+    const val = localStorage.getItem(key);
+    if (val !== null) {
+      const ok = await setVault(key, val);
+      if (ok) {
+        localStorage.removeItem(key); // sadece başarıyla kopyalandıktan sonra sil
+        console.log(`[Migration] ${key} → IndexedDB ✓`);
+      }
+    }
+  }
+  // bio cred hassas değil (sadece credential ID) ama biometric ile tutarlılık için
+  const bioCred = localStorage.getItem(SK_BIO_CRED);
+  if (bioCred) {
+    await setVault(SK_BIO_CRED, bioCred);
+    localStorage.removeItem(SK_BIO_CRED);
+    // SK_BIO_BLOB da varsa taşı
+    const bioBlob = localStorage.getItem(SK_BIO_BLOB);
+    if(bioBlob){ await setVault(SK_BIO_BLOB, bioBlob); localStorage.removeItem(SK_BIO_BLOB); }
+  }
+}
+
+// ── Vault config (localStorage — hassas değil) ───────────────────────────────
 function getVaultConfig() {
   try { return JSON.parse(localStorage.getItem(SK_CONFIG) || "{}"); } catch { return {}; }
 }
@@ -67,7 +169,80 @@ function setVaultConfig(cfg) {
   localStorage.setItem(SK_CONFIG, JSON.stringify({ ...getVaultConfig(), ...cfg }));
 }
 function getAuthMode() {
-  return getVaultConfig().authMode || "pin"; // eski vault'lar için default pin
+  return getVaultConfig().authMode || "pin";
+}
+
+// ── XSS-safe Markdown renderer ───────────────────────────────────────────────
+// Güvenlik: Input HTML-escape edilir ÖNCE, sonra markdown pattern'ları uygulanır.
+// Bu sayede kullanıcı <script> gibi tag inject edemez.
+// href'ler sanitizeHref() ile doğrulanır: sadece http/https/mailto izinli.
+function sanitizeHref(h) {
+  try { const u=new URL(h); if(["http:","https:","mailto:"].includes(u.protocol))return h; } catch {}
+  return /^[a-zA-Z0-9/_\-.#?=&%]+$/.test(h)?h:"#";
+}
+
+function renderMarkdown(raw) {
+  if (!raw) return "";
+  // 1. HTML escape — XSS firewall
+  let t = raw.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  // 2. Wiki links [[Note Title]]
+  t = t.replace(/\[\[([^\]]+)\]\]/g, (_,title) =>
+    `<span class="wiki-link" data-wiki="${title.replace(/"/g,"&quot;")}" style="color:#5b7cf6;border-bottom:1px dashed #5b7cf6;cursor:pointer;font-style:italic;">[[${title}]]</span>`
+  );
+  // 3. Markdown patterns
+  return t
+    .replace(/^### (.+)$/gm,"<h3>$1</h3>").replace(/^## (.+)$/gm,"<h2>$1</h2>").replace(/^# (.+)$/gm,"<h1>$1</h1>")
+    .replace(/\*\*(.+?)\*\*/g,"<strong>$1</strong>").replace(/\*(.+?)\*/g,"<em>$1</em>")
+    .replace(/`(.+?)`/g,"<code>$1</code>").replace(/~~(.+?)~~/g,"<del>$1</del>")
+    .replace(/^- (.+)$/gm,"<li>$1</li>").replace(/(<li>[\s\S]*?<\/li>)/g,"<ul>$1</ul>")
+    .replace(/^\d+\. (.+)$/gm,"<_li>$1</_li>").replace(/(<_li>[\s\S]*?<\/_li>)/g,"<ol>$1</ol>")
+    .replace(/<_li>/g,"<li>").replace(/<\/_li>/g,"</li>")
+    .replace(/^&gt; (.+)$/gm,"<blockquote>$1</blockquote>")
+    .replace(/\[(.+?)\]\((.+?)\)/g,(_,txt,href)=>`<a href="${sanitizeHref(href)}" target="_blank" rel="noopener noreferrer">${txt}</a>`)
+    .replace(/^(?!<[hubloa]|<blockquote)(.+)$/gm,"<p>$1</p>").replace(/\n{2,}/g,"");
+}
+
+// ── DOMParser tabanlı ikinci geçiş sanitizer ─────────────────────────────────
+// renderMarkdown'dan gelen HTML'i DOM'da parse edip
+// izin verilmeyen tag/attribute'ları temizler.
+// Bu katman sayesinde pattern match kaçıranlar da engellenir.
+const SAFE_TAGS  = new Set(['p','br','strong','em','del','code','pre','blockquote','h1','h2','h3','ul','ol','li','a','span','div']);
+const SAFE_ATTRS = new Set(['href','target','rel','class','style','data-wiki']);
+
+function sanitizeParsedHTML(html) {
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    function walk(node) {
+      for(const child of Array.from(node.childNodes)){
+        if(child.nodeType !== Node.ELEMENT_NODE){ continue; }
+        const tag = child.tagName.toLowerCase();
+        if(!SAFE_TAGS.has(tag)){
+          // Zararlı tag — text içeriğini koru, wrapper'ı kaldır
+          const txt = document.createTextNode(child.textContent);
+          node.replaceChild(txt, child); continue;
+        }
+        // on* attribute'ları ve izinsiz attribute'ları kaldır
+        for(const attr of Array.from(child.attributes)){
+          if(!SAFE_ATTRS.has(attr.name) || attr.name.startsWith('on')){
+            child.removeAttribute(attr.name);
+          }
+        }
+        if(child.hasAttribute('href')){
+          child.setAttribute('href', sanitizeHref(child.getAttribute('href')));
+          child.setAttribute('rel','noopener noreferrer');
+        }
+        walk(child);
+      }
+    }
+    walk(doc.body);
+    return doc.body.innerHTML;
+  } catch { return ""; }
+}
+
+// safeRenderMarkdown = renderMarkdown + sanitizeParsedHTML (çift katman)
+function safeRenderMarkdown(raw) {
+  if(!raw) return '';
+  return sanitizeParsedHTML(renderMarkdown(raw));
 }
 
 // ── Core crypto ───────────────────────────────────────────────────────────────
@@ -146,21 +321,19 @@ function timingSafeEqual(a, b) {
 //   Recovery blob da aynı şekilde yeniden şifrelenir.
 async function migrateVaultSecret(oldSecret, newSecret, newMode) {
   // Notes
-  const rawNotes = localStorage.getItem(SK_NOTES);
+  const rawNotes = await getVault(SK_NOTES);
   if (rawNotes) {
     const plain = await decryptData(rawNotes, oldSecret);
-    localStorage.setItem(SK_NOTES, await encryptData(plain, newSecret));
+    await setVault(SK_NOTES, await encryptData(plain, newSecret));
   }
-  // Recovery blob
-  const rawRec = localStorage.getItem(SK_RECOVERY);
+  const rawRec = await getVault(SK_RECOVERY);
   if (rawRec) {
     try {
       const plain = await decryptData(rawRec, oldSecret);
-      localStorage.setItem(SK_RECOVERY, await encryptData(plain, newSecret));
-    } catch {} // recovery blob farklı key ile şifreliyse atla
+      await setVault(SK_RECOVERY, await encryptData(plain, newSecret));
+    } catch {}
   }
-  // Verifier + config güncelle
-  localStorage.setItem(SK_PIN, await makeVerifier(newSecret));
+  await setVault(SK_PIN, await makeVerifier(newSecret));
   setVaultConfig({ authMode: newMode, version: CRYPTO_VERSION });
 }
 
@@ -176,9 +349,6 @@ async function migrateVaultSecret(oldSecret, newSecret, newMode) {
 //   SK_BIO_BLOB  = base64(AES-256-GCM encrypted sessionPin)
 //                  key = PBKDF2(credentialId, fixed_salt) — deterministik ama cihaza özgü
 
-const SK_BIO_CRED = "aether_bio_cred";
-const SK_BIO_BLOB = "aether_bio_blob";
-const BIO_SALT    = new TextEncoder().encode("aether-bio-v1-fixed-salt");
 
 function isBiometricAvailable() {
   return !!(window.PublicKeyCredential && navigator.credentials);
@@ -218,14 +388,14 @@ async function biometricRegister(sessionSecret) {
   );
   const out = new Uint8Array(12 + ct.byteLength);
   out.set(iv, 0); out.set(new Uint8Array(ct), 12);
-  localStorage.setItem(SK_BIO_CRED, JSON.stringify({ credId }));
-  localStorage.setItem(SK_BIO_BLOB, buf2b64(out.buffer));
-  return credId;
+  // Biometric credential'ları IndexedDB'ye yaz — localStorage'a değil
+  await setVault(SK_BIO_CRED, JSON.stringify({ credId }));
+  await setVault(SK_BIO_BLOB, buf2b64(out.buffer));
 }
 
 async function biometricUnlock() {
   if (!isBiometricAvailable()) throw new Error("WebAuthn desteklenmiyor");
-  const stored = localStorage.getItem(SK_BIO_CRED);
+  const stored = await getVault(SK_BIO_CRED);
   if (!stored) throw new Error("Kayıtlı biyometrik yok");
   const { credId } = JSON.parse(stored);
   const challenge = crypto.getRandomValues(new Uint8Array(32));
@@ -241,7 +411,8 @@ async function biometricUnlock() {
     },
   });
   // Doğrulama başarılı — blob'u çöz
-  const rawBlob = new Uint8Array(b642buf(localStorage.getItem(SK_BIO_BLOB)));
+  const rawBlobB64 = await getVault(SK_BIO_BLOB);
+  const rawBlob = new Uint8Array(b642buf(rawBlobB64));
   const iv = rawBlob.slice(0, 12);
   const ct = rawBlob.slice(12);
   const key = await deriveKey(credId, BIO_SALT);
@@ -249,12 +420,12 @@ async function biometricUnlock() {
   return new TextDecoder().decode(pt); // sessionSecret
 }
 
-function hasBiometricRegistered() {
-  return !!localStorage.getItem(SK_BIO_CRED);
+async function hasBiometricRegistered() {
+  return await hasVault(SK_BIO_CRED);
 }
-function removeBiometric() {
-  localStorage.removeItem(SK_BIO_CRED);
-  localStorage.removeItem(SK_BIO_BLOB);
+async function removeBiometric() {
+  await removeVault(SK_BIO_CRED);
+  await removeVault(SK_BIO_BLOB);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -322,12 +493,12 @@ function normalizePhrase(p) {
 async function saveRecoveryBlob(notes, phrase) {
   const payload = JSON.stringify({ notes, savedAt: new Date().toISOString() });
   const blob    = await encryptData(payload, normalizePhrase(phrase));
-  localStorage.setItem(SK_RECOVERY, blob);
+  await setVault(SK_RECOVERY, blob);
 }
 
 // Recovery blob aç: phrase ile çöz
 async function openRecoveryBlob(phrase) {
-  const raw = localStorage.getItem(SK_RECOVERY);
+  const raw = await getVault(SK_RECOVERY);
   if (!raw) throw new Error("Recovery blob bulunamadı");
   const plain = await decryptData(raw, normalizePhrase(phrase));
   return JSON.parse(plain).notes;
@@ -446,6 +617,7 @@ export default function App() {
   const [phraseConfirmed,setPhraseConfirmed] = useState(false);
   // Migration state
   const [showMigrate,setShowMigrate]     = useState(false);
+  const [hasRecovery,setHasRecovery]     = useState(false); // async: IndexedDB'de recovery blob var mı
   const [migrateStep,setMigrateStep]     = useState("verify"); // "verify"|"setup"|"done"
   const [migrateOldInput,setMigrateOldInput] = useState("");
   const [migrateNewInput,setMigrateNewInput] = useState("");
@@ -457,7 +629,7 @@ export default function App() {
   const sessionPhrase = useRef(null);
   // Biometric (WebAuthn) — PIN/passphrase şifrelemeyi değiştirmez, sadece hızlı erişim
   const [bioAvailable,setBioAvailable]   = useState(false);
-  const [bioRegistered,setBioRegistered] = useState(hasBiometricRegistered);
+  const [bioRegistered,setBioRegistered] = useState(false); // async init in useEffect
   const [bioLoading,setBioLoading]       = useState(false);
 
   // Recovery flow
@@ -535,8 +707,16 @@ export default function App() {
   const recoveryRef  = useRef(null);
 
   useEffect(()=>{
-    const v=localStorage.getItem(SK_PIN);
-    if(v) setSavedVerifier(v); else setIsSettingPin(true);
+    // Migration + PIN yükle (async IIFE — useEffect direkt async olamaz)
+    (async () => {
+      await migrateFromLocalStorage();
+      const v = await getVault(SK_PIN);
+      if(v) setSavedVerifier(v); else setIsSettingPin(true);
+      const has = await hasVault(SK_RECOVERY);
+      setHasRecovery(has);
+      const bioReg = await hasBiometricRegistered();
+      setBioRegistered(bioReg);
+    })();
     const s=localStorage.getItem(SK_STATS);
     if(s) try{setStats(JSON.parse(s));}catch{}
 
@@ -578,14 +758,14 @@ export default function App() {
   },[showToast]);
 
   const loadNotes=useCallback(async(p)=>{
-    const raw=localStorage.getItem(SK_NOTES); if(!raw)return[];
+    const raw=await getVault(SK_NOTES); if(!raw)return[];
     try{ return JSON.parse(await decryptData(raw,p)); }catch{ return[]; }
   },[]);
 
   const saveNotes=useCallback(async(arr)=>{
     if(!sessionPin.current) return;
     // PIN ile şifrele
-    localStorage.setItem(SK_NOTES, await encryptData(JSON.stringify(arr), sessionPin.current));
+    await setVault(SK_NOTES, await encryptData(JSON.stringify(arr), sessionPin.current));
     // Recovery blob'u da güncelle (phrase varsa)
     if(sessionPhrase.current) {
       await saveRecoveryBlob(arr, sessionPhrase.current);
@@ -677,12 +857,13 @@ export default function App() {
     const secret = setupMode==="passphrase" ? passInput : confirmPin;
     const mode   = setupMode || "pin";
     const v = await makeVerifier(secret);
-    localStorage.setItem(SK_PIN, v); setSavedVerifier(v); setIsSettingPin(false);
+    await setVault(SK_PIN, v); setSavedVerifier(v); setIsSettingPin(false);
     setVaultConfig({ authMode: mode, version: CRYPTO_VERSION });
     setAuthMode(mode);
     sessionPin.current = secret;
     const loaded = await loadNotes(secret); setNotes(loaded);
     await saveRecoveryBlob(loaded, phrase);
+    setHasRecovery(true);
     setLoading(false); setScreen("app"); setPinStep("enter");
     setGeneratedPhrase(""); setPassInput(""); setConfirmPass(""); setSetupMode(null);
     resetAutoLock(); showToast("Aether oluşturuldu! 🎉");
@@ -715,11 +896,12 @@ export default function App() {
           setRecoveryLoading(true);
           // Yeni PIN ile tüm verileri yeniden şifrele
           const v=await makePinVerifier(np);
-          localStorage.setItem(SK_PIN,v); setSavedVerifier(v);
+          await setVault(SK_PIN, v); setSavedVerifier(v);
           sessionPin.current=np; sessionPhrase.current=normalizePhrase(recoveryInput);
           const arr=recoveredNotes.current||[];
-          localStorage.setItem(SK_NOTES, await encryptData(JSON.stringify(arr),np));
+          await setVault(SK_NOTES, await encryptData(JSON.stringify(arr),np));
           await saveRecoveryBlob(arr, recoveryInput);
+          setHasRecovery(true);
           setNotes(arr); if(arr.length>0) setActiveId(arr[0].id);
           updStats(arr); setRecoveryLoading(false);
           setScreen2(null); setScreen("app"); resetAutoLock();
@@ -815,7 +997,7 @@ export default function App() {
     {id:"import",  label:"Aether İçe Aktar",    icon:"📥", action:()=>{importRef.current?.click();setCmdOpen(false);}},
     {id:"stats",   label:"İstatistikler",       icon:"📊", action:()=>{setShowStats(true);setCmdOpen(false);}},
     {id:"theme",   label:theme==="dark"?"Aydınlık Mod":"Karanlık Mod", icon:theme==="dark"?"☀":"🌙", action:()=>{toggleTheme();setCmdOpen(false);}},
-    {id:"lock",    label:"Aether'i Kilitle",     icon:"🔒", action:()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");setCmdOpen(false);}},
+    {id:"lock",    label:"Aether'i Kilitle",     icon:"🔒", action:()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");setPassInput("");setConfirmPass("");setCmdOpen(false);}},
     ...CATEGORIES.filter(c=>c.id!=="all").map(c=>({
       id:`cat-${c.id}`, label:`${c.label} notlarını göster`, icon:c.icon,
       action:()=>{setFilterCat(c.id);setCmdOpen(false);}
@@ -1193,7 +1375,7 @@ export default function App() {
               {bioLoading?"Doğrulanıyor…":"🪪 Face ID / Parmak İzi ile Aç"}
             </button>
           )}
-          {!isSettingPin&&localStorage.getItem(SK_RECOVERY)&&(
+          {!isSettingPin&&hasRecovery&&(
             <button style={{background:"none",border:`1px solid ${T.border}`,color:T.textMuted,
               padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}
               onClick={()=>{setScreen2("recovery");setRecoverySuccess(false);setRecoveryInput("");setRecoveryError("");}}>
@@ -1273,7 +1455,7 @@ export default function App() {
           ⚙️
         </button>
         <button style={{...topBtn(T),color:T.danger}} title="Kilitle"
-          onClick={()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");}}>🔒</button>
+          onClick={()=>{sessionPin.current=null;sessionPhrase.current=null;setScreen("lock");setPin("");setPassInput("");setConfirmPass("");}}>🔒</button>
       </div>
 
       <div style={{display:"flex",flex:1,overflow:"hidden"}}>
@@ -1611,7 +1793,7 @@ export default function App() {
               {ePreview
                 ?<div
                     style={{flex:1,padding:"20px 24px",overflowY:"auto",lineHeight:1.9,fontSize:14,color:T.text}}
-                    dangerouslySetInnerHTML={{__html:renderMarkdown(eContent)||`<p style="color:${T.textMuted}">İçerik yok</p>`}}
+                    dangerouslySetInnerHTML={{__html:safeRenderMarkdown(eContent)||`<p style="color:${T.textMuted}">İçerik yok</p>`}}
                     onClick={e=>{
                       // Wiki link tıklaması
                       const wiki=e.target.dataset?.wiki;
@@ -1867,12 +2049,12 @@ export default function App() {
               borderRadius:12,padding:16,display:"flex",flexDirection:"column",gap:10}}>
               <div style={{fontWeight:600,fontSize:13,color:T.text}}>🔑 Recovery Phrase</div>
               <div style={{fontSize:12,color:T.textMuted,lineHeight:1.7}}>
-                {localStorage.getItem(SK_RECOVERY)
+                {hasRecovery
                   ?"Recovery blob mevcut ✓ — Phrase'ini unuttuysan veya yeni bir tane oluşturmak istiyorsan aşağıdan yapabilirsin."
                   :"⚠ Henüz recovery phrase oluşturulmamış. Hemen oluşturmanı öneririz."}
               </div>
               <div style={{display:"flex",gap:8,flexDirection:"column"}}>
-                {localStorage.getItem(SK_RECOVERY)&&(
+                {hasRecovery&&(
                   <button style={{background:T.accent,border:"none",color:"#fff",
                     padding:"9px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit",fontWeight:600}}
                     onClick={()=>{
@@ -1882,12 +2064,12 @@ export default function App() {
                     👁 Phrase'imi Görüntüle
                   </button>
                 )}
-                <button style={{background:localStorage.getItem(SK_RECOVERY)?T.inputBg:T.accent,
+                <button style={{background:hasRecovery?T.inputBg:T.accent,
                   border:`1px solid ${T.inputBorder}`,
-                  color:localStorage.getItem(SK_RECOVERY)?T.textSub:"#fff",
+                  color:hasRecovery?T.textSub:"#fff",
                   padding:"9px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}
                   onClick={()=>{
-                    if(localStorage.getItem(SK_RECOVERY)&&!window.confirm("Mevcut phrase silinip YENİ bir phrase oluşturulacak.\nEski phrase artık çalışmayacak. Devam et?")) return;
+                    if(hasRecovery&&!window.confirm("Mevcut phrase silinip YENİ bir phrase oluşturulacak.\nEski phrase artık çalışmayacak. Devam et?")) return;
                     setShowSettings(false); setShowPhrase(true); setPhraseMode("new");
                     setPhrasePin(""); setPhrasePinErr(""); setPhraseRevealed(""); setNewPhraseGenerated("");
                   }}>
@@ -1938,7 +2120,7 @@ export default function App() {
                 <button style={{background:"transparent",border:`1px solid ${T.danger}44`,
                   color:T.danger,padding:"8px 0",borderRadius:8,cursor:"pointer",
                   fontSize:12,fontFamily:"inherit"}}
-                  onClick={()=>{ removeBiometric(); setBioRegistered(false); showToast("Biyometrik kaldırıldı"); }}>
+                  onClick={async()=>{ await removeBiometric(); setBioRegistered(false); showToast("Biyometrik kaldırıldı"); }}>
                   Biyometriği Kaldır
                 </button>
               ))}
@@ -1989,7 +2171,7 @@ export default function App() {
                 fontSize:12,fontFamily:"inherit"}}
                 onClick={()=>{
                   if(window.confirm("Dikkat: Tüm notlar silinecek!\n\nDevam etmek istiyor musun?")){
-                    localStorage.clear(); window.location.reload();
+                    clearVault().then(()=>{ localStorage.clear(); window.location.reload(); });
                   }
                 }}>
                 Aether'i Sıfırla (tüm veriler silinir)
@@ -2425,7 +2607,7 @@ export default function App() {
                                 setMigrateLoading(true);
                                 try{
                                   await migrateVaultSecret(sessionPin.current,migrateNewInput,'pin');
-                                  setSavedVerifier(localStorage.getItem(SK_PIN));
+                                  (async()=>{ const v=await getVault(SK_PIN); setSavedVerifier(v); })();
                                   setAuthMode('pin'); sessionPin.current=migrateNewInput;
                                   setMigrateTargetMode('pin'); setMigrateStep('done');
                                 }catch(e){ setMigrateError('Hata: '+e.message); }
@@ -2456,7 +2638,7 @@ export default function App() {
                     try{
                       const oldSecret = migrateOldInput || sessionPin.current;
                       await migrateVaultSecret(oldSecret, migrateNewInput, "passphrase");
-                      setSavedVerifier(localStorage.getItem(SK_PIN));
+                      (async()=>{ const v=await getVault(SK_PIN); setSavedVerifier(v); })();
                       setAuthMode("passphrase");
                       sessionPin.current=migrateNewInput;
                       setMigrateStep("done");
