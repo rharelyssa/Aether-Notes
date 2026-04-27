@@ -177,8 +177,20 @@ function getAuthMode() {
 // Bu sayede kullanıcı <script> gibi tag inject edemez.
 // href'ler sanitizeHref() ile doğrulanır: sadece http/https/mailto izinli.
 function sanitizeHref(h) {
-  try { const u=new URL(h); if(["http:","https:","mailto:"].includes(u.protocol))return h; } catch {}
-  return /^[a-zA-Z0-9/_\-.#?=&%]+$/.test(h)?h:"#";
+  if(!h) return "#";
+  // Protocol-relative URL engelle (//evil.com → could be https://evil.com)
+  if(h.startsWith('//')) return "#";
+  // Path traversal engelle
+  if(h.includes('../') || h.includes('..\\')) return "#";
+  // Null byte engelle
+  if(h.includes('\x00')) return "#";
+  try {
+    const u = new URL(h);
+    if(["http:","https:","mailto:"].includes(u.protocol)) return h;
+    return "#";
+  } catch {}
+  // Relative path: sadece alfanumerik ve güvenli karakterler
+  return /^[a-zA-Z0-9/_\-.#?=&%]+$/.test(h) ? h : "#";
 }
 
 function renderMarkdown(raw) {
